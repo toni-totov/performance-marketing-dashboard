@@ -1,5 +1,7 @@
 # Performance Marketing Dashboard
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/stlnos7ar)
+
 A single, "app-like" Excel workbook that replaces scattered spreadsheets with
 one polished task tracker + campaign dashboard for a performance marketing
 role. No dynamic arrays, no add-ins — built to run on Excel 2016/2019 using
@@ -74,3 +76,12 @@ All 13 originally-scoped sheets are planned and implemented per `PLAN.md`'s
 Implementation Checklist. This is an actively used personal tool — the
 debugging log in `PLAN.md` tracks real bugs found (and fixed) after
 day-to-day use.
+
+## Support
+
+This started as a personal tool to make my own workday a bit easier, and
+I'm happy to share it in case it helps yours too. If you find it useful and
+feel like buying me a coffee, it's truly appreciated — but browsing,
+using, and adapting it is always free, no strings attached either way.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/stlnos7ar)

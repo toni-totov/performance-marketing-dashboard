@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local Claude Code settings (machine-specific permissions, not shared config)
+.claude/settings.local.json
+
+# Build/test scratch artifacts
+_smoketest_cf.xlsx
+
+# Intermediate build output (no VBA yet) -- Performance Marketing Dashboard.xlsm
+# is the real deliverable and is committed; the .xlsx is a throwaway
+# structure-only step produced along the way by build_dashboard.py.
+Performance Marketing Dashboard.xlsx
+
+# Personal working copies -- never publish a copy that may contain real
+# task/campaign/login data typed in by hand.
+Task_Tracker_Toni_V2.xlsm
+Task_Tracker_*.xlsm

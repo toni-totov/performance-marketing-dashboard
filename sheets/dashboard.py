@@ -132,14 +132,17 @@ def _friendly_hours_formula(hours_expr):
     )
 
 # --- Cross-sheet ranges this sheet reads from ---
-_TASKS_ID = "Tasks!$A$2:$A$501"
-_TASKS_TASK = "Tasks!$E$2:$E$501"
-_TASKS_PROJECT = "Tasks!$H$2:$H$501"
-_TASKS_PRIORITY = "Tasks!$J$2:$J$501"
-_TASKS_DEADLINE = "Tasks!$K$2:$K$501"
-_TASKS_DAYS_LEFT = "Tasks!$M$2:$M$501"
-_TASKS_TIME_SPENT = "Tasks!$O$2:$O$501"
-_TASKS_SORT_KEY = "Tasks!$W$2:$W$501"
+# Tasks' own row allowance (sheets/tasks.py's LAST_DATA_ROW) -- kept in
+# sync by hand since these are plain formula-string literals, not a
+# shared import (matches sheets/campaigns.py's own _TASKS_LAST_ROW).
+_TASKS_ID = "Tasks!$A$2:$A$1500"
+_TASKS_TASK = "Tasks!$E$2:$E$1500"
+_TASKS_PROJECT = "Tasks!$H$2:$H$1500"
+_TASKS_PRIORITY = "Tasks!$J$2:$J$1500"
+_TASKS_DEADLINE = "Tasks!$K$2:$K$1500"
+_TASKS_DAYS_LEFT = "Tasks!$M$2:$M$1500"
+_TASKS_TIME_SPENT = "Tasks!$O$2:$O$1500"
+_TASKS_SORT_KEY = "Tasks!$W$2:$W$1500"
 
 _CAMPAIGNS_NAME = "Campaigns!$C$3:$C$202"
 _CAMPAIGNS_START = "Campaigns!$E$3:$E$202"
@@ -257,7 +260,7 @@ _KPI_CARDS = [
     (
         "Total Hours Invested",
         "G",
-        _friendly_hours_formula("SUM(Tasks!$O$2:$O$501)+SUM(ArchiveTable[Time Spent (hrs)])"),
+        _friendly_hours_formula("SUM(Tasks!$O$2:$O$1500)+SUM(ArchiveTable[Time Spent (hrs)])"),
         "General",
     ),
     ("Overdue Tasks", "J", f'=COUNTIFS({_TASKS_DAYS_LEFT},"<0")', "General"),

@@ -49,6 +49,15 @@ Private Const MT_FIRST_DATA_ROW As Long = 2
 Private mScheduledTimes As Collection
 Private mReminderQueue As Collection
 
+' Field separator for the FIFO queue's packed "Name<sep>Time<sep>Minutes"
+' strings. The null character (a non-typable control character), not a
+' literal "|" -- a "|" can legitimately appear in a user-typed meeting
+' name, which used to shift every field after it and throw inside
+' FireMeetingReminder (user-reported: an unhandled error firing as a
+' blocking modal the moment a reminder popped).
+Private Const REMINDER_INFO_SEP As String = vbNullChar
+
+
 ' ============================================================================
 ' Month navigation (Schedule's own ScheduleYear/ScheduleMonth)
 ' ============================================================================
@@ -303,8 +312,8 @@ End Function
 ' minutes before the meeting; a reminder that would land at a negative
 ' offset (settings where Count*Interval overshoots FirstOffset) is
 ' silently skipped rather than firing after the meeting has started.
-' outInfos entries are "MeetingName|HH:MM|MinutesBefore", consumed by
-' FireMeetingReminder via Split(.... "|").
+' outInfos entries are "MeetingName<sep>HH:MM<sep>MinutesBefore" (see
+' REMINDER_INFO_SEP), consumed by FireMeetingReminder via Split().
 Public Sub CollectDueReminders(todayDate As Date, nowTime As Date, ByRef outTimes() As Date, ByRef outInfos() As String, ByRef outCount As Long)
     outCount = 0
     ReDim outTimes(1 To 1000)
@@ -344,7 +353,7 @@ Public Sub CollectDueReminders(todayDate As Date, nowTime As Date, ByRef outTime
                         If reminderTime > nowTime Then
                             outCount = outCount + 1
                             outTimes(outCount) = reminderTime
-                            outInfos(outCount) = meetingName & "|" & Format(startTimeOfDay, "hh:nn") & "|" & CStr(CLng(minutesBefore))
+                            outInfos(outCount) = meetingName & REMINDER_INFO_SEP & Format(startTimeOfDay, "hh:nn") & REMINDER_INFO_SEP & CStr(CLng(minutesBefore))
                         End If
                     End If
                 Next i
@@ -426,14 +435,37 @@ End Sub
 ' The fixed Application.OnTime callback target -- see module header
 ' comment for why this pops a FIFO queue instead of receiving parameters
 ' directly (OnTime can't pass any).
+'
+' Top-level On Error is not optional here the way it is for a regular
+' Application.Run-tested entry point -- this fires unattended, live, on
+' the user's own screen (user-reported: it used to pop a blocking
+' "Run-time error" dialog with no handler at all). Also guards against
+' Application.Ready being False (OnTime firing while the user is mid-edit
+' in a cell) -- showing a modal UserForm in that state can throw, so this
+' reschedules itself a few seconds later instead of losing the reminder
+' or crashing.
 Public Sub FireMeetingReminder()
+    On Error GoTo ErrHandler
+
+    If Not Application.Ready Then
+        Application.OnTime EarliestTime:=Now + TimeSerial(0, 0, 5), Procedure:="FireMeetingReminder"
+        Exit Sub
+    End If
+
     Dim info As String
     info = PopNextReminderInfo()
     If Len(info) = 0 Then Exit Sub
 
     Dim parts() As String
-    parts = Split(info, "|")
+    parts = Split(info, REMINDER_INFO_SEP)
+    If UBound(parts) < 2 Then Exit Sub
+
     frmMeetingReminder.ShowReminder parts(0), parts(1), CLng(parts(2))
+    Exit Sub
+ErrHandler:
+    ' Never let an unhandled error surface as a blocking modal dialog on
+    ' the user's screen -- worst case this reminder is silently missed,
+    ' which is far better than an unattended runtime-error popup.
 End Sub
 
 ' Split from FireMeetingReminder specifically so tests can verify queue

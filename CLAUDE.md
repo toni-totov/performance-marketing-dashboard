@@ -4,13 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-This repository is currently **planning-only** — there is no code yet, only `PLAN.md`. Do not invent build/lint/test commands or architecture that isn't in `PLAN.md`; none exists until implementation starts.
+This repository is **fully implemented and past handoff** — `build_dashboard.py`, `sheets/*.py`, `vba/*.bas`, `inject_vba.py` all exist, and a committed `Performance Marketing Dashboard.xlsm`/`.xlsx` template is checked in. The project is in **post-handoff maintenance mode**: the user has a separate, real, actively-used copy of the workbook on a work laptop (not this repo's committed file). **As of 2026-08-17 the delivery model changed** (PLAN.md §21): rather than continuing to hand-edit that live file cell-by-cell/module-by-module forever, the user's laptop copy hit Tasks' row ceiling and they asked for a freshly rebuilt workbook ("V3") plus a self-service migration tool (`vba/modMigration.bas`, ships in every build) that copies their real data out of the old file and into the new one **entirely on their own machine** (their data is confidential/internal-network-only, so it never passes through this session). The day-to-day work here is still mostly diagnosing and fixing bugs, just delivered as "rebuild + let the user migrate" going forward rather than exclusively as manual line-edit instructions — see PLAN.md §21 for the full design and CLAUDE.md's own `Application.Run` qualification gotcha below, found while testing it. **Before doing anything, check `PROGRESS.md`** (repo root) for a quick "where we left off" status and any pending next steps — it's a short pointer, not a substitute for reading further.
 
-`PLAN.md` is the single source of truth for every design decision made so far. It is built incrementally, one Excel sheet at a time, across many sessions, and is kept scannable via numbered sections (`## 1.` … ) with `[[Section Name]]`-style cross-references between them. **Before making any change to this project, read `PLAN.md` in full** — decisions in later sections sometimes correct or supersede earlier ones (each correction is called out inline with a `> **Corrected from the original draft**` blockquote), so the most recent text in a section is authoritative, not the first mention of a topic.
+`PLAN.md` is the single source of truth for every design decision made so far, including everything already built. It is kept scannable via numbered sections (`## 1.` … ) with `[[Section Name]]`-style cross-references between them. **Before making any change to this project, read the relevant sections of `PLAN.md`** — decisions in later sections sometimes correct or supersede earlier ones (each correction is called out inline with a `> **Corrected from the original draft**` blockquote), so the most recent text in a section is authoritative, not the first mention of a topic. §19 is the (now-complete) build checklist; **§20 ("Debugging log, post-handoff") is the actively-growing log of bugs found on the live work-laptop file since handoff** — read it before diagnosing anything reported against that file, since a fix may already be documented there (including ones the user hasn't confirmed applying yet — check the `Status` field of each entry).
 
-When asked to continue planning a not-yet-designed sheet, or to revise an already-planned one, follow the same pattern already established throughout `PLAN.md`: confirm genuinely ambiguous design forks with the user before locking them in, document *why* a decision was made (not just what it is), and flag any technical necessity that goes beyond what the user literally asked for (e.g. hidden helper columns, stable keys) as such.
-
-All 13 sheets are now planned, and `PLAN.md` §19 (Implementation Checklist) is the authoritative, ordered, checkbox-tracked roadmap for actually building the code — phased (shared building blocks → sheets in dependency order → VBA → injection → verification) with every item cross-referenced back to the section that specifies it. **When asked to implement anything, work from that checklist** — check items off (`- [x]`) as they're completed rather than re-deriving a build order from scratch, and don't skip ahead to a later phase's sheet before its dependencies (listed inline, e.g. "go back and wire Tasks' Linked Campaign now that Campaigns exists") are actually in place.
+If asked to plan a genuinely new sheet or feature (rare at this stage), follow the same pattern already established throughout `PLAN.md`: confirm genuinely ambiguous design forks with the user before locking them in, document *why* a decision was made (not just what it is), and flag any technical necessity that goes beyond what the user literally asked for (e.g. hidden helper columns, stable keys) as such.
 
 ## What this project is
 
@@ -284,6 +282,56 @@ Other lessons learned the hard way, worth not re-learning:
   always does a raw `ListRows.Add` instead of checking "is this still the
   untouched template row" first (`Archive` this time, alongside the
   already-known `Schedule Data`/`Campaigns Archive` pattern).
+- **`Range.Replace` has no `LookIn` parameter** (that belongs to
+  `Range.Find` only). Passing `LookIn:=xlFormulas` as a named argument to
+  `.Replace()` does not raise a compile error when the code is injected
+  at runtime via `CodeModule.AddFromString` (unlike a statically-compiled
+  module, where the VBE would flag it immediately) — instead, calling
+  that Sub/Function via `Application.Run` **hangs indefinitely**, with no
+  error, no exception, and `Application.Ready`/`CalculationState` both
+  reporting the app as idle the whole time (ruling out both a blocking
+  modal and an actively-running loop as the apparent cause). This cost a
+  large number of bisected test runs before the bad parameter was spotted
+  by diffing two otherwise-identical macros line by line. When a
+  `Run`-invoked macro hangs with those symptoms, suspect an invalid named
+  argument on whatever Excel object-model call sits at the exact line
+  checkpoint-tracing narrows it to (PLAN.md §20's Bug entries have a
+  worked example) — don't assume a hang implies bad data or an infinite
+  loop; verify every named parameter actually exists on that method's
+  real signature first.
+- A migration/extension test that seeds its "donor" row with only plain
+  values (bypassing events, to avoid triggering the hierarchy engine
+  mid-setup) can miss a real bug if that sheet also has **dynamic
+  per-row styling applied only conditionally at runtime**, separate from
+  the sheet's static "generous pre-formatted allowance" (e.g. Tasks'
+  Up/Down/Timer "button" look, applied only to rows holding a real task
+  via `RefreshButtonStyling`, never baked in at build time). A donor row
+  that's realistically "at capacity" already has that dynamic styling
+  applied; a test that seeds only bare values doesn't, so copying that
+  row's format in the test looks safe when the same copy on a real
+  at-capacity row bleeds the button styling onto every new blank row.
+  Explicitly exercise a sheet's dynamic runtime styling on the donor row
+  before copying its format in any such test, not just its values.
+- **`Application.Run("Module.Proc", args...)` fails with "the macro may
+  not be available in this workbook" the instant a SECOND workbook is
+  open — even a plain `.xlsx` with no VBA project at all — regardless of
+  argument types or which workbook is active.** Confirmed live while
+  testing `modMigration.bas` (PLAN.md §21, the only module so far that
+  legitimately needs two workbooks open at once): the unqualified
+  `"ModuleName.ProcName"` form only reliably resolves when exactly one
+  workbook is open; fully qualifying it with the macro-host workbook's
+  name (`"'" & wb.Name & "'!ModuleName.ProcName"`) fixed it immediately,
+  with no other change. This only affects **test harnesses driving VBA
+  via COM from outside** — real in-VBA calls between Subs in the same
+  project (e.g. `modMigration`'s own `MigrateFromV2` calling
+  `MigrateTasksAndArchive srcWb` directly, never through
+  `Application.Run`) are completely unaffected, since that's an ordinary
+  same-project procedure call, not macro-name resolution. Whenever a COM
+  test needs `Workbooks.Open` on a second file (a migration/import
+  feature, a "compare against a fixture" test, etc.), qualify every
+  `Application.Run` call with the host workbook's name from the start
+  rather than debugging a generic "macro not available" error the slow
+  way.
 
 ## Recurring architectural patterns established across sheets
 

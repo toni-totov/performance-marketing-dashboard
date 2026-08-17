@@ -51,6 +51,7 @@ STANDARD_MODULES = [
     "modCalendar",
     "modMonthlyMediaPlan",
     "modSchedule",
+    "modMigration",
 ]
 
 # (sheet tab name, .bas file name) -- injected directly into that sheet's

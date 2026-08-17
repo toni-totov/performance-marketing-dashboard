@@ -50,14 +50,17 @@ End Type
 ' Task/TaskKey read back correctly via direct cell access, but
 ' End(xlUp).Row reported the row above it). Every hierarchy-engine
 ' function that needs "the last row with a key" uses this instead of
-' End(xlUp) directly. 5000 is a generous fixed scan bound, comfortably
-' beyond any hierarchy sheet's own row allowance (Tasks: 500, Recurring
-' Tasks: 100) -- a full scan of that many cells is still trivially fast.
+' End(xlUp) directly. 20000 is a generous fixed scan bound, comfortably
+' beyond any hierarchy sheet's own row allowance (Recurring Tasks: 100;
+' Tasks grows in +500 increments via modTasks.bas's row extender -- see
+' its own design note -- so this bound needs to stay well ahead of that
+' growth, not just the allowance at any one point in time). A full scan
+' of that many cells is still trivially fast.
 Public Function LastHierarchyRow(ws As Worksheet, keyCol As Long, firstDataRow As Long) As Long
     Dim r As Long
     Dim result As Long
     result = firstDataRow - 1
-    For r = firstDataRow To 5000
+    For r = firstDataRow To 20000
         If Len(Trim$(ws.Cells(r, keyCol).Value & "")) > 0 Then
             result = r
         End If
@@ -86,7 +89,7 @@ Public Sub RenumberHierarchy(ws As Worksheet, colMap As HierarchyColumnMap)
     ' WalkChildren's recursive call right back into the *same* root
     ' children group (since a phantom node's own Key is also 0), growing
     ' cursor past rowCount until orderedIndexes(cursor) throws Subscript
-    ' out of range. Rows: 500-row (Tasks) / 100-row (Recurring Tasks)
+    ' out of range. Rows: 1500-row (Tasks) / 100-row (Recurring Tasks)
     ' pre-formatted tables mean a user can plausibly type into a non-
     ' contiguous blank row, leaving genuinely blank rows inside the scan
     ' range -- not just a theoretical edge case. rowCount is now the

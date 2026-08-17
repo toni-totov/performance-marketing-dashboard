@@ -46,6 +46,13 @@ Private Const COL_LINKED_CAMPAIGN_KEY As Long = 22
 ' absolute ranges, so they self-heal as data moves underneath them during
 ' RenumberHierarchy's clear-and-rewrite; including them would instead
 ' freeze their currently-cached values as static numbers, destroying them.
+' Named here (previously only used as bare literals in sheets/tasks.py)
+' because the row extender below needs to address them directly.
+Private Const COL_SORT_KEY As Long = 23
+Private Const COL_CAMPAIGN_SORT_HELPER As Long = 24
+Private Const COL_CAMPAIGN_RANK As Long = 25
+Private Const COL_CAMPAIGN_RANK_KEY As Long = 26
+Private Const COL_FRIENDLY_TIME_SPENT As Long = 27
 
 Private Const FIRST_DATA_ROW As Long = 2
 
@@ -59,6 +66,9 @@ Private Const CAMPAIGNS_COL_KEY As Long = 25
 ' --- Campaigns Archive column layout (sheets/campaigns_archive.py) ---------
 Private Const CAMPAIGNS_ARCHIVE_COL_NAME As Long = 1
 Private Const CAMPAIGNS_ARCHIVE_COL_KEY As Long = 8
+
+' --- Row extender (see ExtendTaskRows below) --------------------------------
+Private Const ROW_EXTENDER_INCREMENT As Long = 500
 
 ' Public so Recurring Tasks' generation macro (modRecurringTasks.bas) can
 ' reuse it directly when writing into Tasks -- avoids a second,
@@ -900,4 +910,410 @@ Private Sub SortDescending(arr() As Long, n As Long)
         i = i + 1
         j = j - 1
     Loop
+End Sub
+
+' ============================================================================
+' Row extender -- "keep this tracker usable for years" (user-requested):
+' a permanent, re-runnable "add 500 more rows" action instead of a one-off
+' manual row-count bump (PLAN.md §20 Bug #9's original fix). See
+' sheets/tasks.py's own note next to TasksRowAllowance for the full design
+' rationale.
+'
+' Every place Tasks' current row bound is baked into something has to be
+' touched on every extension -- found by an exhaustive audit, not just
+' patching whatever Bug #9's fix happened to touch:
+'   - Tasks' own Number of Subtasks (col F) and CampaignRank (col Y)
+'     formulas -- each embeds an absolute $2:$<bound> range INSIDE its
+'     formula text, for EVERY row (not just new ones), since
+'     RenumberHierarchy deliberately never rewrites either column (see
+'     COL_SORT_KEY's comment above) -- a row's formula, once written,
+'     keeps whatever bound it was written with forever.
+'   - Dashboard's and Campaigns' cross-sheet SUMIFS/COUNTIFS/lookup
+'     ranges -- also literal $2:$<bound> text, but scattered across many
+'     formulas per sheet rather than one column, so these are patched via
+'     a sheet-wide literal-substring Replace instead of enumerating cells.
+'   - Data validation and conditional formatting on the new rows.
+'   - modCampaigns.bas's own TASKS_LAST_DATA_ROW bound -- now a Function
+'     reading TasksRowAllowance directly, so it no longer needs touching.
+' ============================================================================
+
+' TasksRowAllowance is a workbook-scoped Defined Name holding a bare
+' constant (sheets/tasks.py's build-time bootstrap), not a cell/range
+' reference -- Evaluate() returns its numeric value directly either way.
+' On Error GoTo, not just a bare read: this is called from
+' RowExtenderBannerRow, which Tasks.bas's dispatcher calls on EVERY
+' double-click anywhere on the sheet -- if the Name doesn't exist yet
+' (workbook never bootstrapped) this would otherwise throw unhandled on
+' every single double-click, popping CLAUDE.md's documented blocking
+' modal. Returns 0 on failure so RowExtenderBannerRow degrades to "row 1"
+' (never a real Target.Row -- Tasks.bas's dispatcher already exits before
+' row 2) instead of propagating an error.
+Private Function TasksRowAllowance() As Long
+    On Error GoTo ErrHandler
+    TasksRowAllowance = CLng(Application.Evaluate("TasksRowAllowance"))
+    Exit Function
+ErrHandler:
+    TasksRowAllowance = 0
+End Function
+
+Private Sub SetTasksRowAllowance(ByVal n As Long)
+    ThisWorkbook.Names("TasksRowAllowance").RefersTo = "=" & n
+End Sub
+
+' Public so Tasks.bas's dispatcher can check "did the user just double-
+' click the banner" without duplicating the +1 math.
+Public Function RowExtenderBannerRow() As Long
+    RowExtenderBannerRow = TasksRowAllowance() + 1
+End Function
+
+' One-time bootstrap for a workbook built BEFORE this feature existed (the
+' user's real live laptop file) -- a workbook freshly built via
+' build_dashboard.py + inject_vba.py already has both the Name and the
+' banner from sheets/tasks.py's build() step, so this is a no-op there.
+' Safe to re-run: does nothing (just reports current state) if
+' TasksRowAllowance already exists.
+'
+' Split into a MsgBox-free core (independently callable via Application.Run,
+' same convention as ExtendTaskRows/HandleRowExtenderClick below) and a thin
+' interactive wrapper -- BootstrapRowExtender itself must never be driven
+' via Application.Run in a COM test, since its own MsgBox would block
+' waiting for a click exactly like an unhandled runtime error does.
+Public Function BootstrapRowExtenderCore() As String
+    On Error GoTo ErrHandler
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Sheets("Tasks")
+
+    Dim already As Boolean
+    already = False
+    Dim nm As Variant
+    For Each nm In ThisWorkbook.Names
+        If nm.Name = "TasksRowAllowance" Then already = True
+    Next nm
+
+    If already Then
+        BootstrapRowExtenderCore = "ALREADY (" & TasksRowAllowance() & ")"
+        Exit Function
+    End If
+
+    ThisWorkbook.Names.Add Name:="TasksRowAllowance", RefersTo:="=501"
+    DrawRowExtenderBanner ws, 501
+    BootstrapRowExtenderCore = "OK"
+    Exit Function
+ErrHandler:
+    BootstrapRowExtenderCore = "ERROR " & Err.Number & ": " & Err.Description
+End Function
+
+Public Sub BootstrapRowExtender()
+    Dim result As String
+    result = BootstrapRowExtenderCore()
+    If result = "OK" Then
+        MsgBox "Row extender is ready. A ""+ Add 500 More Task Rows"" button now appears at row 502.", _
+            vbInformation, "Row extender bootstrap"
+    ElseIf Left(result, 7) = "ALREADY" Then
+        MsgBox "TasksRowAllowance already exists. Nothing to do.", vbInformation, "Row extender bootstrap"
+    Else
+        MsgBox "Bootstrap failed:" & vbNewLine & result, vbCritical, "Row extender bootstrap"
+    End If
+End Sub
+
+Public Sub HandleRowExtenderClick()
+    Dim result As String
+    result = ExtendTaskRows()
+    If result = "OK" Then
+        MsgBox "Added " & ROW_EXTENDER_INCREMENT & " more rows. Tasks now goes up to row " & _
+            TasksRowAllowance() & ".", vbInformation, "Rows added"
+    Else
+        MsgBox "Couldn't add more rows:" & vbNewLine & result, vbExclamation, "Row extender"
+    End If
+End Sub
+
+' Core logic, independently callable via Application.Run (bypasses the
+' MsgBox above -- same split as every other MsgBox-fronted handler in this
+' module). Returns "OK" or "ERROR <n>: <description>", never lets an error
+' propagate unhandled.
+Public Function ExtendTaskRows() As String
+    On Error GoTo ErrHandler
+    Dim prevEvents As Boolean, prevScreen As Boolean
+    prevEvents = Application.EnableEvents
+    prevScreen = Application.ScreenUpdating
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+
+    Dim ws As Worksheet, dashWs As Worksheet, campWs As Worksheet
+    Set ws = ThisWorkbook.Sheets("Tasks")
+    Set dashWs = ThisWorkbook.Sheets("Dashboard")
+    Set campWs = ThisWorkbook.Sheets("Campaigns")
+
+    Dim oldLast As Long, newLast As Long
+    oldLast = TasksRowAllowance()
+    newLast = oldLast + ROW_EXTENDER_INCREMENT
+
+    ' The banner cell (A<oldLast+1>:F<oldLast+1>) is about to become an
+    ' ordinary data row -- unmerge and strip its special look before the
+    ' template-row loop below formats it like every other new row.
+    Dim bannerRange As Range
+    Set bannerRange = ws.Range(ws.Cells(oldLast + 1, 1), ws.Cells(oldLast + 1, 6))
+    bannerRange.UnMerge
+    bannerRange.ClearFormats
+    bannerRange.ClearContents
+
+    ' Built from scratch, never copied from an existing row -- PLAN.md §20
+    ' Bug #9 attempt #1's exact mistake was copying the (possibly real,
+    ' possibly button-styled) last row's format onto new blank rows.
+    Dim r As Long
+    For r = oldLast + 1 To newLast
+        BuildTaskTemplateRow ws, r, newLast
+    Next r
+
+    ' Both range-bound formula columns get rewritten for ALL rows 2..newLast
+    ' (old rows included) -- their embedded bound is stale everywhere, not
+    ' just past the old boundary.
+    RewriteNumSubtasksFormulas ws, newLast
+    RewriteCampaignRankFormulas ws, newLast
+
+    ExtendValidationAndCF ws, oldLast, newLast
+
+    ReplaceRowBound dashWs, oldLast, newLast
+    ReplaceRowBound campWs, oldLast, newLast
+
+    SetTasksRowAllowance newLast
+    DrawRowExtenderBanner ws, newLast
+
+    Application.EnableEvents = prevEvents
+    Application.ScreenUpdating = prevScreen
+    ExtendTaskRows = "OK"
+    Exit Function
+ErrHandler:
+    Application.EnableEvents = prevEvents
+    Application.ScreenUpdating = prevScreen
+    ExtendTaskRows = "ERROR " & Err.Number & ": " & Err.Description
+End Function
+
+' Builds one brand-new row's number formats, position-relative formulas,
+' alignment, and hairline border -- mirrors sheets/tasks.py's build()
+' loop exactly (kept in sync by hand, same convention as every other
+' cross-file column-layout constant in this project). newLast is the
+' CampaignRank/Number-of-Subtasks bound this row's formulas should use.
+Private Sub BuildTaskTemplateRow(ws As Worksheet, r As Long, newLast As Long)
+    Dim DQ As String
+    DQ = Chr(34)
+
+    ws.Cells(r, COL_START_DATE).NumberFormat = "DD.MM.YYYY HH:MM"
+    ws.Cells(r, COL_DEADLINE).NumberFormat = "DD.MM.YYYY HH:MM"
+    ws.Cells(r, COL_TIME_SPENT).NumberFormat = "0.00"
+    ws.Cells(r, COL_NOTES).NumberFormat = "General;General;General;" & DQ & modDesignSystem.ICON_NOTES() & DQ
+
+    Dim idRange As String, thisId As String, countExpr As String
+    idRange = "$A$2:$A$" & newLast
+    thisId = "A" & r
+    countExpr = "COUNTIF(" & idRange & "," & thisId & "&" & DQ & ".*" & DQ & ")"
+    ws.Cells(r, COL_NUM_SUBTASKS).Formula = "=IF(" & countExpr & "=0," & DQ & DQ & "," & countExpr & ")"
+
+    Dim dl As String
+    dl = "K" & r   ' Deadline
+    ws.Cells(r, COL_DAYS_LEFT).Formula = "=IF(" & dl & "=" & DQ & DQ & "," & DQ & DQ & ",INT(" & dl & ")-TODAY())"
+
+    Dim ts As String
+    ts = "O" & r   ' Time Spent (hrs)
+    ws.Cells(r, COL_FRIENDLY_TIME_SPENT).Formula = _
+        "=IF(" & ts & "=" & DQ & DQ & "," & DQ & DQ & ",TEXT(INT(ROUND(" & ts & "*60,0)/60)," & DQ & "0" & DQ & ")&" & _
+        DQ & "h " & DQ & "&TEXT(MOD(ROUND(" & ts & "*60,0),60)," & DQ & "00" & DQ & ")&" & DQ & "m" & DQ & ")"
+
+    Dim key As String
+    key = "Q" & r   ' TaskKey
+    ws.Cells(r, COL_SORT_KEY).Formula = "=IF(" & dl & "=" & DQ & DQ & "," & DQ & DQ & "," & dl & "+" & key & "/1000000)"
+
+    Dim lck As String
+    lck = "V" & r   ' LinkedCampaignKey
+    ws.Cells(r, COL_CAMPAIGN_SORT_HELPER).Formula = _
+        "=IF(" & lck & "=" & DQ & DQ & "," & DQ & DQ & ",IF(" & dl & "=" & DQ & DQ & ",9999999+" & key & "/1000000," & _
+        dl & "+" & key & "/1000000))"
+
+    Dim cshRange As String, lckRange As String, csh As String
+    cshRange = "$X$2:$X$" & newLast
+    lckRange = "$V$2:$V$" & newLast
+    csh = "X" & r
+    ws.Cells(r, COL_CAMPAIGN_RANK).Formula = _
+        "=IF(" & lck & "=" & DQ & DQ & "," & DQ & DQ & ",SUMPRODUCT((" & lckRange & "=" & lck & ")*(" & _
+        cshRange & "<=" & csh & ")))"
+
+    Dim rankCell As String
+    rankCell = "Y" & r
+    ws.Cells(r, COL_CAMPAIGN_RANK_KEY).Formula = _
+        "=IF(" & lck & "=" & DQ & DQ & "," & DQ & DQ & "," & lck & "&" & DQ & "|" & DQ & "&" & rankCell & ")"
+
+    Dim c As Variant
+    For Each c In Array(COL_ID, COL_NUM_SUBTASKS, COL_SUBTASK_OF, COL_DAYS_LEFT, COL_FRIENDLY_TIME_SPENT)
+        With ws.Cells(r, CLng(c))
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlCenter
+        End With
+    Next c
+
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, COL_FRIENDLY_TIME_SPENT)).Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlHairline
+        .Color = modDesignSystem.COLOR_GRIDLINE
+    End With
+End Sub
+
+' Rewrites Number of Subtasks (col F) for EVERY row 2..newLast -- old rows
+' included, since their embedded $2:$<bound> range is stale too. Formula
+' shape matches hierarchy.py's number_of_subtasks_formula() exactly.
+Private Sub RewriteNumSubtasksFormulas(ws As Worksheet, newLast As Long)
+    Dim DQ As String
+    DQ = Chr(34)
+    Dim idRange As String
+    idRange = "$A$2:$A$" & newLast
+    Dim r As Long, thisId As String, countExpr As String
+    For r = FIRST_DATA_ROW To newLast
+        thisId = "A" & r
+        countExpr = "COUNTIF(" & idRange & "," & thisId & "&" & DQ & ".*" & DQ & ")"
+        ws.Cells(r, COL_NUM_SUBTASKS).Formula = "=IF(" & countExpr & "=0," & DQ & DQ & "," & countExpr & ")"
+    Next r
+End Sub
+
+' Rewrites CampaignRank (col Y) for EVERY row 2..newLast -- same reasoning
+' as above. Formula shape matches sheets/tasks.py's build() loop exactly
+' (PLAN.md §20 Bug #9's original fix, generalized to run on demand).
+Private Sub RewriteCampaignRankFormulas(ws As Worksheet, newLast As Long)
+    Dim DQ As String
+    DQ = Chr(34)
+    Dim cshRange As String, lckRange As String
+    cshRange = "$X$2:$X$" & newLast
+    lckRange = "$V$2:$V$" & newLast
+    Dim r As Long, lck As String, csh As String
+    For r = FIRST_DATA_ROW To newLast
+        lck = "V" & r
+        csh = "X" & r
+        ws.Cells(r, COL_CAMPAIGN_RANK).Formula = _
+            "=IF(" & lck & "=" & DQ & DQ & "," & DQ & DQ & ",SUMPRODUCT((" & lckRange & "=" & lck & ")*(" & _
+            cshRange & "<=" & csh & ")))"
+    Next r
+End Sub
+
+' Data validation + conditional formatting for the new rows. DV is added
+' fresh only to the new range (old rows' DV is left completely alone). CF
+' rules already applying to the old range are resized via
+' ModifyAppliesToRange -- extends the SAME rule objects (preserving
+' whatever fill/formula they already carry) rather than recreating them,
+' sidestepping the openpyxl-vs-VBA CF-fill/border authoring quirks
+' documented in CLAUDE.md entirely, since nothing is being newly created.
+Private Sub ExtendValidationAndCF(ws As Worksheet, oldLast As Long, newLast As Long)
+    Dim newRange As Range
+
+    Set newRange = ws.Range(ws.Cells(oldLast + 1, COL_PRIORITY), ws.Cells(newLast, COL_PRIORITY))
+    With newRange.Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="Low,Medium,High"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+    End With
+
+    Set newRange = ws.Range(ws.Cells(oldLast + 1, COL_STATUS), ws.Cells(newLast, COL_STATUS))
+    With newRange.Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="Not Started,In Progress,Completed,Delete"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+    End With
+
+    Set newRange = ws.Range(ws.Cells(oldLast + 1, COL_LINKED_CAMPAIGN), ws.Cells(newLast, COL_LINKED_CAMPAIGN))
+    With newRange.Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="=CampaignNameList"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+    End With
+
+    Set newRange = ws.Range(ws.Cells(oldLast + 1, COL_DEADLINE), ws.Cells(newLast, COL_DEADLINE))
+    With newRange.Validation
+        .Delete
+        .Add Type:=xlValidateCustom, AlertStyle:=xlValidAlertStop, Formula1:="=FALSE"
+        .ErrorTitle = "Use the picker instead"
+        .ErrorMessage = "Double-click this cell to pick a date from the Calendar instead."
+    End With
+
+    Set newRange = ws.Range(ws.Cells(oldLast + 1, COL_NOTES), ws.Cells(newLast, COL_NOTES))
+    With newRange.Validation
+        .Delete
+        .Add Type:=xlValidateCustom, AlertStyle:=xlValidAlertStop, Formula1:="=FALSE"
+        .ErrorTitle = "Use the picker instead"
+        .ErrorMessage = "Double-click this cell to open the Notes popup instead."
+    End With
+
+    ExtendCFAppliesTo ws, COL_PRIORITY, COL_PRIORITY, newLast
+    ExtendCFAppliesTo ws, COL_DAYS_LEFT, COL_DAYS_LEFT, newLast
+    ExtendCFAppliesTo ws, COL_STATUS, COL_STATUS, newLast
+    ExtendCFAppliesTo ws, COL_TASK, COL_TASK, newLast                     ' subtask "prefix" rule
+    ExtendCFAppliesTo ws, COL_NUM_SUBTASKS, COL_NUM_SUBTASKS, newLast     ' magnitude ramp
+    ExtendCFAppliesTo ws, 1, 16, newLast                                  ' depth shading, A:P
+End Sub
+
+' Queries the SINGLE anchor cell (FIRST_DATA_ROW, firstCol) for its
+' FormatConditions -- reliable per Excel's object model (unlike querying a
+' large multi-row Range, which is not guaranteed to enumerate every rule
+' that touches it) -- and resizes each one found to FIRST_DATA_ROW..newLast
+' across firstCol..lastCol.
+Private Sub ExtendCFAppliesTo(ws As Worksheet, firstCol As Long, lastCol As Long, newLast As Long)
+    Dim newRange As Range
+    Set newRange = ws.Range(ws.Cells(FIRST_DATA_ROW, firstCol), ws.Cells(newLast, lastCol))
+
+    ' Direct iteration -- confirmed live via COM (scratchpad debug probes,
+    ' this session) that snapshotting each FormatCondition into a
+    ' `Dim conds() As FormatCondition` array first, then calling
+    ' ModifyAppliesToRange on the array elements, throws "RPC_E_DISCONNECTED"
+    ' on every single condition, on every column tried (Priority, DaysLeft,
+    ' the 16-column depth-shading range). Storing a FormatCondition
+    ' reference in an array element evidently invalidates its COM
+    ' connection. Calling ModifyAppliesToRange directly on
+    ' FormatConditions.Item(i) inside a plain For loop (no snapshot) works
+    ' correctly and was verified not to hit any enumerator-invalidation
+    ' issue in practice.
+    Dim srcConditions As FormatConditions
+    Set srcConditions = ws.Cells(FIRST_DATA_ROW, firstCol).FormatConditions
+    Dim n As Long, i As Long
+    n = srcConditions.Count
+    For i = 1 To n
+        srcConditions.Item(i).ModifyAppliesToRange newRange
+    Next i
+End Sub
+
+' Sheet-wide literal-substring replace of the row bound, for sheets whose
+' Tasks-referencing formulas are scattered across many cells rather than
+' one column (Dashboard, Campaigns) -- same mechanism PLAN.md §20 Bug #9's
+' original fix used, confirmed reliable there. Deliberately NO LookIn:=
+' argument -- Range.Replace has no such parameter; passing one doesn't
+' raise a compile error when injected via AddFromString, it hangs
+' Application.Run indefinitely with no error (CLAUDE.md's hard-won
+' lesson). LookAt:=xlPart is required since "$<bound>" is only ever part
+' of a larger formula (e.g. "$K$2:$K$1500"), never the whole cell content.
+Private Sub ReplaceRowBound(ws As Worksheet, oldLast As Long, newLast As Long)
+    ws.Cells.Replace What:="$" & oldLast, Replacement:="$" & newLast, LookAt:=xlPart, MatchCase:=True
+End Sub
+
+' Moves the "add more rows" banner down to sit one row below the new
+' allowance. Mirrors sheets/tasks.py's own banner exactly so a rebuilt
+' file and a live-extended file always look identical. Uses BorderAround
+' (not per-edge .Borders on the anchor cell alone) -- design_system.py's
+' apply_box_outline docstring explains why the naive per-anchor-cell
+' border renders incomplete on a merged range; BorderAround is VBA's own
+' correct native equivalent for a merged cell.
+Private Sub DrawRowExtenderBanner(ws As Worksheet, newLast As Long)
+    Dim bannerRow As Long
+    bannerRow = newLast + 1
+    Dim rng As Range
+    Set rng = ws.Range(ws.Cells(bannerRow, 1), ws.Cells(bannerRow, 6))
+    rng.Merge
+    rng.Cells(1, 1).Value = "+ Add 500 More Task Rows"
+    With rng
+        .Font.Name = modDesignSystem.FONT_NAME
+        .Font.Size = modDesignSystem.FONT_SIZE_BODY
+        .Font.Bold = True
+        .Font.Color = modDesignSystem.COLOR_INK_PRIMARY
+        .Interior.Color = modDesignSystem.COLOR_CARD_SURFACE
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+        .BorderAround LineStyle:=xlContinuous, Weight:=xlThin, Color:=modDesignSystem.COLOR_INK_MUTED
+    End With
 End Sub

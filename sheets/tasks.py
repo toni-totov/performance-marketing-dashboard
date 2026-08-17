@@ -39,7 +39,7 @@ consistent with Monthly Media Plan's Gantt (also plain-range, also
 formula-position-sensitive) rather than its Campaign Table.
 """
 
-from openpyxl.styles import Alignment, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -55,7 +55,7 @@ from .hierarchy import (
 SHEET_NAME = "Tasks"
 HEADER_ROW = 1
 FIRST_DATA_ROW = 2
-LAST_DATA_ROW = 501  # generous pre-formatted allowance, see module docstring
+LAST_DATA_ROW = 1500  # generous pre-formatted allowance, see module docstring (raised from 500, user ran out)
 
 _DATE_TIME_FORMAT = "DD.MM.YYYY HH:MM"
 _HOURS_FORMAT = "0.00"
@@ -341,6 +341,31 @@ def build(wb):
             buckets=[(1, 100), (3, 150), (6, 200), (11, 250), (21, 300)],
         ),
     )
+
+    # --- Row extender banner + row-allowance bookkeeping (user-requested,
+    # "keep this tracker usable for years, not just until the rows run
+    # out") -- a permanent, re-runnable "add 500 more rows" button rather
+    # than a one-off manual row-count bump. TasksRowAllowance is a
+    # workbook-scoped Defined Name holding a bare constant (not a cell/
+    # range reference) -- the single source of truth for "how many rows
+    # are currently allotted," read by modTasks.bas's extender AND
+    # modCampaigns.bas's ResolveMiniListTaskNotesCell (converted from a
+    # hardcoded Const to a Function reading this Name) so neither ever
+    # needs its own bound patched by hand again. The banner cell always
+    # sits exactly one row below the current allowance; the extender
+    # macro moves it down each time it runs. See PLAN.md's row-extender
+    # design note for the full list of formulas this bound touches.
+    from openpyxl.workbook.defined_name import DefinedName
+
+    wb.defined_names["TasksRowAllowance"] = DefinedName("TasksRowAllowance", attr_text=str(LAST_DATA_ROW))
+
+    banner_row = LAST_DATA_ROW + 1
+    ws.merge_cells(f"A{banner_row}:F{banner_row}")
+    banner = ws.cell(row=banner_row, column=1, value="+ Add 500 More Task Rows")
+    banner.font = Font(name=ds.FONT_NAME, size=ds.FONT_SIZE_BODY, bold=True, color=ds.INK_PRIMARY)
+    banner.fill = PatternFill("solid", fgColor=ds.CARD_SURFACE)
+    ds.apply_box_outline(ws, f"A{banner_row}:F{banner_row}", color=ds.INK_MUTED)
+    banner.alignment = Alignment(horizontal="center", vertical="center")
 
     # --- Sheet tab color (core daily-use sheet, §17.9) ---
     ws.sheet_properties.tabColor = ds.TAB_CORE

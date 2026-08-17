@@ -4033,6 +4033,19 @@ Entries are added as bugs are reported, most recent last.
      should now see the "Type the task name first…" message instead of
      the popup, and no data gets written.
 - **Status:** fix given, awaiting user confirmation after manual apply.
+  **Flagged again 2026-08-11**: the user reported "notes icon missing on
+  Tasks, only sometimes/certain rows" in a later session, without
+  reference to this entry (it wasn't checked against `PLAN.md` §20 first
+  — a process gap, noted in `CLAUDE.md`). This bug's exact symptom is a
+  strong match for what was reported. Confirmed the *source* fix (the
+  `Case 16`/`Case 11`/`Case 14` TaskKey guards) is already present in
+  `vba/Tasks.bas` in this repo — but whether the user ever actually
+  applied the manual steps above to their live work-laptop file is still
+  unconfirmed. If not, real note text may have been silently discarded on
+  some rows (not just mis-displayed), which is more serious than the
+  cosmetic fix given in the same later session (Bug #9 below). **Next
+  session: confirm with the user whether this fix was ever applied; if
+  not, walk them through it before anything else.**
 
 ### Bug #3 — Notes icon not showing on one specific (already-working) task row
 
@@ -4130,5 +4143,681 @@ Entries are added as bugs are reported, most recent last.
   > icon, not `??`.
 - **Status:** fix given (superseding the Format-Cells-dialog attempt
   above), awaiting user confirmation after manual apply.
+  **See Bug #2's 2026-08-11 note** — also a plausible match for a later
+  "notes icon missing sometimes" report; unconfirmed whether ever applied.
+
+### Bug #4 — Formula bar hidden while active broke copy/paste from other workbooks
+
+- **Symptom:** user copies a cell in a different Excel workbook, switches
+  to the tracker, pastes — the clipboard's copy state is gone (paste does
+  nothing / pastes stale content), "a bit buggy" when switching back.
+- **Root cause:** `ThisWorkbook.bas`'s `Workbook_Activate`/
+  `Workbook_Deactivate` (added in the §17.10 modernization pass,
+  user-requested at the time) toggled `Application.DisplayFormulaBar`
+  off/on as the tracker gained/lost focus, so the formula bar would hide
+  while the tracker was active. Toggling this Excel-wide display setting
+  turns out to cancel the OS clipboard's "marching ants" copy state when
+  switching windows — confirmed by the user's exact reproduction steps
+  (copy elsewhere → switch to tracker → paste fails).
+- **Fix (source):** `vba/ThisWorkbook.bas` — removed
+  `Workbook_Activate`/`Workbook_Deactivate` entirely, and the
+  now-unneeded `DisplayFormulaBar = True` restore in
+  `Workbook_BeforeClose`. Formula bar stays visible permanently, like any
+  other workbook.
+- **Fix (manual, apply on work laptop):**
+  1. **Alt+F11** → double-click **ThisWorkbook** in the tree.
+  2. Select all the code (**Ctrl+A**) and replace with:
+     ```vba
+     Private Sub Workbook_Open()
+         On Error GoTo ErrHandler
+
+         Application.CalculateFullRebuild
+
+         ThisWorkbook.Sheets("Archive").Protect UserInterfaceOnly:=True
+         ThisWorkbook.Sheets("Campaigns Archive").Protect UserInterfaceOnly:=True
+
+         modRecurringTasks.RegenerateRecurringTasks
+         modSchedule.ScheduleReminders
+         modCampaigns.RefreshCampaignNameList
+
+         Dim runningTask As String
+         runningTask = modTasks.FindRunningTimerTaskName()
+         If Len(runningTask) > 0 Then
+             MsgBox "The timer for '" & runningTask & "' was still running when this file was last closed.", vbExclamation, "Timer Left Running"
+         End If
+
+         Exit Sub
+     ErrHandler:
+         ' Never let an unhandled error block the file from opening.
+     End Sub
+
+     Private Sub Workbook_BeforeClose(Cancel As Boolean)
+         On Error Resume Next
+         modSchedule.CancelAllScheduledReminders
+     End Sub
+     ```
+  3. **Ctrl+S** to save (keep `.xlsm`).
+- **Status:** fix given 2026-08-11, awaiting user confirmation (user will
+  test on work laptop the evening of 2026-08-12).
+
+### Bug #5 — Schedule reminder popup sometimes threw a blocking "Run-time error"
+
+- **Symptom:** user occasionally got an error dialog when a meeting
+  reminder notification fired.
+- **Root cause:** two stacked bugs in `modSchedule.bas`. (1)
+  `FireMeetingReminder` — the fixed `Application.OnTime` callback target
+  — had **no error handling at all**, violating this file's own hard
+  rule (see "Testing VBA via COM automation" above): any runtime error
+  inside it surfaced as an unhandled, blocking modal on the user's
+  screen. (2) Each reminder was packed as `"MeetingName|HH:MM|
+  MinutesBefore"` and unpacked via `Split(info, "|")` — a meeting name
+  that itself contains `|` would shift every field after it, and
+  `CLng()` on the wrong field throws.
+- **Fix (source):** `vba/modSchedule.bas` —
+  - New module-level `Private Const REMINDER_INFO_SEP As String =
+    vbNullChar`, used instead of `"|"` in both `CollectDueReminders`
+    (where the packed string is built) and `FireMeetingReminder` (where
+    it's split) — a control character that can never appear in typed
+    text, unlike `"|"`.
+  - `FireMeetingReminder` now has `On Error GoTo ErrHandler` (swallows
+    silently — a missed reminder beats a blocking dialog) and a bounds
+    check (`If UBound(parts) < 2 Then Exit Sub`) before indexing into the
+    split result.
+  - Also guards `Application.Ready` at the top — if the reminder fires
+    while the user is mid-edit in a cell (showing a modal `UserForm` in
+    that state can throw), it reschedules itself 5 seconds later instead
+    of losing the reminder or crashing.
+- **Fix (manual, apply on work laptop):**
+  1. **Alt+F11** → double-click **modSchedule** in the tree.
+  2. Find `Private mScheduledTimes As Collection` /
+     `Private mReminderQueue As Collection` near the top; add right
+     after:
+     ```vba
+     Private Const REMINDER_INFO_SEP As String = vbNullChar
+     ```
+  3. Find the line inside `CollectDueReminders` that builds
+     `outInfos(outCount)` (uses `"|"` twice) and replace it with:
+     ```vba
+     outInfos(outCount) = meetingName & REMINDER_INFO_SEP & Format(startTimeOfDay, "hh:nn") & REMINDER_INFO_SEP & CStr(CLng(minutesBefore))
+     ```
+  4. Find the whole `FireMeetingReminder` sub and replace it with:
+     ```vba
+     Public Sub FireMeetingReminder()
+         On Error GoTo ErrHandler
+
+         If Not Application.Ready Then
+             Application.OnTime EarliestTime:=Now + TimeSerial(0, 0, 5), Procedure:="FireMeetingReminder"
+             Exit Sub
+         End If
+
+         Dim info As String
+         info = PopNextReminderInfo()
+         If Len(info) = 0 Then Exit Sub
+
+         Dim parts() As String
+         parts = Split(info, REMINDER_INFO_SEP)
+         If UBound(parts) < 2 Then Exit Sub
+
+         frmMeetingReminder.ShowReminder parts(0), parts(1), CLng(parts(2))
+         Exit Sub
+     ErrHandler:
+         ' Never let an unhandled error surface as a blocking modal dialog.
+     End Sub
+     ```
+  5. **Ctrl+S** to save. Compile check: VBA editor → **Debug → Compile
+     VBA Project** — should show no errors.
+- **Status:** fix given 2026-08-11, awaiting user confirmation.
+
+### Bug #6 — Recurring "Daily" tasks generated on Saturday/Sunday too
+
+- **Symptom:** Daily recurring tasks generated every calendar day
+  including weekends; user deleting the weekend instances by hand every
+  week.
+- **Root cause:** `modRecurringTasks.bas`'s `ComputeScheduledDates`
+  "Daily" case (§12.1) looped every date in the range with no weekday
+  filter — "Daily" meant literally every day, which was never actually
+  the intent for a work task tracker.
+- **Fix (source):** `vba/modRecurringTasks.bas` — the "Daily" case now
+  skips Saturday/Sunday (`Weekday(d, vbMonday) <= 5`). "Daily" now means
+  Mon–Fri; Weekly/Monthly unaffected. Confirmed with the user: redefine
+  "Daily" itself, rather than add a separate "Weekdays" option.
+- **Fix (manual, apply on work laptop):**
+  1. **Alt+F11** → double-click **modRecurringTasks**.
+  2. Find `ComputeScheduledDates`'s `Case "Daily"` block:
+     ```vba
+     Case "Daily"
+         For d = fromDate To throughDate
+             outCount = outCount + 1
+             outDates(outCount) = d
+         Next d
+     ```
+     Replace with:
+     ```vba
+     Case "Daily"
+         For d = fromDate To throughDate
+             If Weekday(d, vbMonday) <= 5 Then
+                 outCount = outCount + 1
+                 outDates(outCount) = d
+             End If
+         Next d
+     ```
+  3. **Ctrl+S** to save.
+- **Status:** fix given 2026-08-11, awaiting user confirmation.
+
+### Bug #7 — Campaigns: notes icon in the expanded task mini-list didn't open
+
+- **Symptom:** expanding a campaign (double-click its name) shows a
+  mini-list of its linked tasks, including a Notes icon per task when
+  that task has a note — but double-clicking that icon did nothing. The
+  campaign's own main Notes cell worked fine; only the per-task
+  mini-list mirror was affected.
+- **Root cause:** that mini-list icon (`sheets/campaigns.py`'s
+  `notes_col`, which reuses the main row's "Status" column position for
+  the summary rows) is a **read-only formula mirror** of the linked
+  task's real Notes cell on Tasks. `Campaigns.bas`'s
+  `Worksheet_BeforeDoubleClick` had no dispatcher branch for that column
+  at all, so double-clicking it fell through to Excel's default
+  behavior (harmless but useless on a formula cell).
+- **Fix (source):**
+  - `vba/modCampaigns.bas` — new `Public Function
+    ResolveMiniListTaskNotesCell(r As Long) As Range`, which resolves a
+    summary row back to the real Tasks row it mirrors using the exact
+    same `CampaignKey&"|"&N` / `CampaignRankKey` match the mini-list's
+    own display formula already uses, so the two can never disagree.
+    Returns `Nothing` for a main/header row or an unlinked slot.
+  - `vba/Campaigns.bas` — new `Case 7` in `Worksheet_BeforeDoubleClick`,
+    calling the resolver and opening `frmNotes` against the real Tasks
+    cell if resolved (naturally a no-op on a main row, since the
+    resolver's row-position math excludes it).
+  - Confirmed with the user: double-clicking should open/edit the real
+    task's note (not just show a "view it on Tasks" message).
+- **Fix (manual, apply on work laptop):**
+  1. **Alt+F11** → double-click **modCampaigns**.
+  2. Find `Private Const ARCHIVE_COL_CAMPAIGN_KEY As Long = 8`; add right
+     after:
+     ```vba
+
+     ' --- Tasks column layout (sheets/tasks.py), needed only to resolve a
+     ' mini-list summary row's Notes icon back to its real Tasks row ---
+     Private Const TASKS_COL_NOTES As Long = 16
+     Private Const TASKS_COL_CAMPAIGN_RANK_KEY As Long = 26
+     Private Const TASKS_FIRST_DATA_ROW As Long = 2
+     Private Const TASKS_LAST_DATA_ROW As Long = 1500
+     ```
+     (Use `500` for the last constant instead of `1500` if Bug #9's row
+     extension hasn't been applied yet.)
+  3. Find the end of `HandleCampaignDoubleClick` (ends `End Function`
+     right after its `ErrHandler:`); add right after it:
+     ```vba
+
+     Public Function ResolveMiniListTaskNotesCell(r As Long) As Range
+         On Error GoTo ErrHandler
+
+         Dim ws As Worksheet
+         Set ws = CampaignsSheet()
+
+         Dim mainRow As Long
+         mainRow = FIRST_DATA_ROW + Int((r - FIRST_DATA_ROW) / SLOT_SIZE) * SLOT_SIZE
+
+         Dim n As Long
+         n = r - (mainRow + 1)
+         If n < 1 Or n > SUMMARY_ROWS_PER_SLOT Then Exit Function
+
+         Dim campaignKey As String
+         campaignKey = Trim$(ws.Cells(mainRow, COL_CAMPAIGN_KEY).Value & "")
+         If Len(campaignKey) = 0 Then Exit Function
+
+         Dim targetKey As String
+         targetKey = campaignKey & "|" & n
+
+         Dim tasksWs As Worksheet
+         Set tasksWs = ThisWorkbook.Sheets("Tasks")
+         Dim rankKeyRange As Range
+         Set rankKeyRange = tasksWs.Range( _
+             tasksWs.Cells(TASKS_FIRST_DATA_ROW, TASKS_COL_CAMPAIGN_RANK_KEY), _
+             tasksWs.Cells(TASKS_LAST_DATA_ROW, TASKS_COL_CAMPAIGN_RANK_KEY))
+
+         Dim matchResult As Variant
+         matchResult = Application.Match(targetKey, rankKeyRange, 0)
+         If IsError(matchResult) Then Exit Function
+
+         Dim taskRow As Long
+         taskRow = TASKS_FIRST_DATA_ROW + CLng(matchResult) - 1
+         Set ResolveMiniListTaskNotesCell = tasksWs.Cells(taskRow, TASKS_COL_NOTES)
+         Exit Function
+     ErrHandler:
+     End Function
+     ```
+  4. Double-click **Campaigns** in the tree (its own sheet module). Find
+     `Case 9    ' Notes` in `Worksheet_BeforeDoubleClick` and insert a
+     new case right before it:
+     ```vba
+     Case 7
+         Dim mirroredNotesCell As Range
+         Set mirroredNotesCell = modCampaigns.ResolveMiniListTaskNotesCell(Target.Row)
+         If Not mirroredNotesCell Is Nothing Then
+             frmNotes.ShowForCell mirroredNotesCell
+             Cancel = True
+         End If
+     ```
+  5. **Ctrl+S** to save.
+- **Status:** fix given 2026-08-11, awaiting user confirmation.
+
+### Bug #8 — Monthly Media Plan row banding looked inverted
+
+- **Symptom:** user reports row 7 (first data row) doesn't get the quiet
+  row-banding shade, row 8 does, row 9 doesn't, row 10 does — the exact
+  opposite of the intended pattern. The Gantt bars color correctly.
+- **Investigation:** checked the actual rendered fill color and the
+  `FormatCondition`'s own formula/priority live via COM on the current
+  build — both are correct (`MOD(ROW()-7,2)=0`, row 7 colored, row 8
+  not). Not reproducible from current source.
+- **Root cause (likely, unconfirmed):** this sheet used to use Excel's
+  built-in banded-table style before the §17.10 modernization pass
+  switched it to this custom quiet-banding CF rule. If the user's
+  work-laptop file predates that change, it's plausible it's still on
+  the old built-in banding, whose specific style variant happens to
+  stripe the opposite parity. **Not proven** — no live access to the
+  laptop file to confirm.
+- **Fix (source):** none needed — current template already correct.
+- **Fix (manual, apply on work laptop):** no macro, just Excel's UI:
+  1. Click any cell in the Monthly Media Plan table.
+  2. **Table Design** ribbon tab (visible only with a table cell
+     selected) → uncheck **Banded Rows**.
+  3. If that alone doesn't fix it, set the table style to **"None"** in
+     the same tab's style gallery.
+- **Status:** fix given 2026-08-11 as a hypothesis, awaiting user
+  confirmation either way — if the UI fix *doesn't* resolve it, this
+  needs a fresh look with actual access to (or a description of) the
+  live file's banding formula.
+
+### Bug #9 — Tasks ran out of rows at 500; extension macro's first version introduced two new bugs
+
+- **Symptom (original):** Tasks sheet's pre-formatted allowance (rows
+  2–501, `sheets/tasks.py`'s `LAST_DATA_ROW`) was fully used — no more
+  properly-formatted rows to add new tasks into.
+- **Fix (source):** `sheets/tasks.py` `LAST_DATA_ROW` raised 501→1500 (a
+  1,500-row allowance, confirmed with the user). Matching literals
+  updated in `sheets/dashboard.py` (`_TASKS_*` cross-sheet ranges) and
+  `sheets/campaigns.py` (`_TASKS_LAST_ROW`) — these are plain
+  formula-string literals kept in sync by hand across the three files,
+  not a shared import, matching this project's existing pattern. No VBA
+  logic needed changing: `modHierarchy.bas`'s scan bound is already a
+  generous fixed `5000`, well beyond either the old or new allowance
+  (only its comments were updated for accuracy).
+- **Fix attempt #1 (manual macro, given 2026-08-10) — turned out to have
+  two bugs**, found only after the user ran it on their real, genuinely
+  full-capacity 500-row file:
+  1. **Button-border bleed**: the macro built new blank rows by copying
+     row 501's *formatting*. But row 501 — the user's literal 500th, at-
+     capacity task — already had the dynamic "button" look
+     (`modDesignSystem.ApplyButtonLook`, applied only to rows holding a
+     real task, via `modTasks.bas`'s `RefreshButtonStyling`, never baked
+     in at build time) applied to its Up/Down/Timer cells. Copying that
+     format bled the button look onto every new blank row too. My own
+     test of the macro didn't catch this because it seeded row 501 with
+     plain values only, never actually applying the dynamic button
+     styling to it first — see the new `CLAUDE.md` lesson on this.
+  2. **Broken campaign linking for any task past row 501**: Tasks' own
+     `CampaignRank` formula (`sheets/tasks.py` column Y/25) hardcodes an
+     absolute `$V$2:$V$501` / `$X$2:$X$501` comparison range *inside the
+     Tasks sheet itself* — separate from, and missed by, the Dashboard/
+     Campaigns boundary fix. Any task linked to a campaign beyond the old
+     row 501 was invisible to that formula's own peer-ranking, breaking
+     "expand campaign" for that task. New `CLAUDE.md` lesson: a
+     `Range.Replace` call with an (invalid, silently-accepted-until-run)
+     `LookIn:=xlFormulas` named argument hung indefinitely rather than
+     erroring when tested against the Tasks sheet — root-caused by
+     diffing two otherwise-identical macros, not by the hang itself
+     giving any signal.
+- **Fix attempt #2 (repair macro, given 2026-08-11)** — re-tested end to
+  end against a proper simulation of the user's exact situation (a
+  genuinely full 500-row Tasks sheet, row 501 with real button styling
+  applied) before being handed back:
+  - `vba/modCampaigns.bas`/Dashboard/Campaigns' own `$501`→`$1500`
+    replace: unchanged, confirmed reliable.
+  - Tasks' `CampaignRank` column (Y): now rewritten cell-by-cell with the
+    correct `$1500`-bounded formula text directly (`.Formula =`, not
+    `Replace`) for **all** rows 2–1500, not just the new ones — both
+    old and new rows had the stale `$501` bound.
+  - Button-border bleed: any row 502–1500 with no TaskKey now gets its
+    Up/Down/Timer cells explicitly reset (`Interior.ColorIndex = xlNone`,
+    borders `xlNone`, alignment back to `xlGeneral`/`xlBottom`) — matches
+    the exact baseline of a genuinely blank row on the current template.
+  - Confirmed via COM: existing task data and formatting (rows 2–501)
+    completely untouched; new rows match a freshly-built 1500-row file
+    exactly; a task linked to a campaign beyond row 501 correctly
+    resolves and the campaign's expand/mini-list feature works for it.
+  - **Fix (manual, apply on work laptop)** — the repair macro (paste
+    into a new standard module, run `RepairTaskRowsExtension`, then
+    delete the module) is long; see the artifact linked in `PROGRESS.md`
+    for the exact code rather than duplicating it here.
+- **Status:** repair macro (attempt #2, 2026-08-11) was **never applied** —
+  on 2026-08-13 the user asked for a permanent, re-runnable fix instead of
+  a one-off 501→1500 patch (see Bug #10 below), and explicitly chose to
+  skip this one-off patch entirely in favor of it. Superseded, not fixed
+  by this entry. Kept here for the two real bugs its own first attempt
+  surfaced (button-border bleed; the Tasks-internal `CampaignRank` bound)
+  — both are permanently fixed by Bug #10's design, not just patched once.
+
+### Bug #10 — Tasks row extender: permanent, re-runnable "add 500 more rows" button
+
+- **Context:** rather than a one-off capacity bump (Bug #9), the user
+  wants Tasks to never run out of usable rows for as long as they use the
+  tracker (years, not months) — a manual button they can click every time
+  they approach the current allowance, extending it by another 500 rows
+  each time, indefinitely.
+- **Design (confirmed with the user via two fork questions, 2026-08-13):**
+  - **Trigger:** a manual button/banner on the Tasks sheet itself (not
+    automatic-on-fill, not a Dashboard button) — user explicitly picked
+    this over the alternatives offered.
+  - **Single source of truth for the current allowance:** a workbook-
+    scoped Defined Name, `TasksRowAllowance`, holding a bare numeric
+    constant (not a range reference) — read by VBA via
+    `Application.Evaluate("TasksRowAllowance")` (NOT
+    `ThisWorkbook.Evaluate` — confirmed via COM that the latter throws
+    Error 438 in this injected-VBA context even though the Name genuinely
+    resolves fine both from Python/COM and from `Application.Evaluate`;
+    new `CLAUDE.md`-worthy gotcha, though not yet promoted there since
+    it's narrower than most existing entries) and updated via
+    `ThisWorkbook.Names("TasksRowAllowance").RefersTo = "=" & n` after
+    each successful extension.
+  - **A freshly-built workbook** (`sheets/tasks.py`'s `build()`) creates
+    this Name (`=501`, i.e. `LAST_DATA_ROW`) and a matching
+    "+ Add 500 More Task Rows" banner row directly at build time — the
+    live/already-built laptop file instead runs a one-time bootstrap
+    macro (`modTasks.BootstrapRowExtender`, Alt+F8) that creates both;
+    safe to re-run (no-ops once the Name exists).
+  - **`modTasks.bas`'s `ExtendTaskRows()`** is the actual extension: bumps
+    the allowance by `ROW_EXTENDER_INCREMENT` (500), then for the new
+    row range — builds each new row from scratch (never copies an
+    existing row's format, learned the hard way in Bug #9 attempt #1);
+    rewrites `Number of Subtasks` (col F) and `CampaignRank` (col Y) for
+    **every** row 2..new-bound, old rows included (both columns embed the
+    allowance as a literal `$2:$<bound>` range in their own formula text,
+    so old rows' formulas go stale too, not just the newly-added ones —
+    this generalizes Bug #9's `CampaignRank` fix and, newly discovered
+    while building this, applies identically to `Number of Subtasks`,
+    which had the exact same latent bug, previously undocumented); adds
+    fresh data validation only to the new rows; extends existing
+    conditional-formatting rules' `AppliesTo` range via
+    `FormatCondition.ModifyAppliesToRange` (see gotcha below); and
+    sheet-wide literal-substring-replaces the old bound with the new one
+    on Dashboard and Campaigns (same mechanism as Bug #9's fix, confirmed
+    reliable there too). Moves the "add more rows" banner down to sit one
+    row below the new allowance.
+  - `modHierarchy.bas`'s `LastHierarchyRow` scan bound raised from `5000`
+    to `20000` — the extender's growth is unbounded over the tracker's
+    lifetime, so the old fixed bound (already generous for Bug #9) needed
+    more headroom.
+  - `modCampaigns.bas`'s `TASKS_LAST_DATA_ROW` converted from a hardcoded
+    `Private Const` into a zero-arg `Private Function` that reads
+    `TasksRowAllowance` directly — no longer needs touching on every
+    extension (Bug #9's fix attempt #2 had to update this literal by hand
+    each time; this design eliminates that entirely going forward).
+- **New `CLAUDE.md`-worthy gotchas found while building/testing this (both
+  confirmed live via COM, both real, both fixed in the shipped code):**
+  1. **A module-level `Private Const` declared after existing
+     `Sub`/`Function` blocks lower down in the same module breaks the
+     whole module's compilation** — the *exact* pitfall already documented
+     in `CLAUDE.md` for `Public`/`Dim`, confirmed to apply identically to
+     `Const`. `ROW_EXTENDER_INCREMENT` was originally declared just above
+     `ExtendTaskRows()` (after ~900 lines of existing procedures) instead
+     of grouped with `modTasks.bas`'s other top-level `Private Const`
+     column-layout constants near the top of the file. The resulting
+     compile error is what caused every session-long "indefinite hang"
+     symptom this feature's development hit over COM — `Application.Run`
+     against a project with a compile error pops a blocking modal (same
+     failure mode as an unhandled runtime error, but *compile-time*, so no
+     `On Error` handler can prevent it) that manifests as an RPC hang or a
+     generic `com_error` with no description over automation, and as a
+     literal "Compile error: Variable not defined" dialog if Excel happens
+     to be visible when it fires (confirmed: it fired on the user's own
+     screen from a `Visible=False` background test instance, since that
+     setting doesn't suppress compile-error dialogs any more than it
+     suppresses runtime-error ones). Fixed by moving the declaration up
+     to the existing constants block.
+  2. **Snapshotting `FormatCondition` objects into a
+     `Dim conds() As FormatCondition` array before calling
+     `ModifyAppliesToRange` on them — added specifically as a defensive
+     measure against a hypothesized (never actually confirmed) "modify
+     while iterating" risk — throws `RPC_E_DISCONNECTED`
+     ("Method 'ModifyAppliesToRange' of object 'FormatCondition' failed")
+     on every single condition, on every column tried.** Storing the
+     object reference in an array element evidently invalidates its COM
+     connection. Calling `ModifyAppliesToRange` directly on
+     `FormatConditions.Item(i)` inside a plain `For` loop — no
+     snapshot — works correctly with no enumerator-invalidation issue in
+     practice. Don't add defensive snapshotting for a COM
+     enumerator-mutation risk that hasn't actually been observed; it can
+     introduce a real bug in place of a theoretical one.
+- **Testing:** full COM suite (`RowExtenderBannerRow` bootstrap check,
+  realistic 500-task bulk-seeded simulation matching the user's actual
+  live-file shape, a full extension run 501→1001, a **second** extension
+  run 1001→1501 to confirm re-runnability, and the standalone bootstrap
+  macro's own end-to-end path starting from a workbook with neither the
+  Name nor the banner) — all passing except one assertion later confirmed
+  to be a false negative (Excel canonicalizes any custom number format
+  containing literal periods, e.g. `"DD.MM.YYYY HH:MM"` →
+  `dd\.mm\.yyyy hh:mm`, on *every* cell regardless of whether openpyxl or
+  VBA set it — confirmed identical on an untouched, never-VBA-touched row
+  built directly by `sheets/tasks.py`).
+- **Apply to the live laptop file:** see `PROGRESS.md` for the exact
+  manual steps (replace `modTasks.bas`/`modHierarchy.bas`/
+  `modCampaigns.bas`/`Tasks.bas`'s content in the VBE, then run
+  `BootstrapRowExtender` once via Alt+F8).
+- **Status:** fully implemented and COM-tested (2026-08-13); apply
+  instructions written; not yet confirmed applied by the user.
+
+### Bug #11 — Campaigns: completing one of several campaigns leaves the freed slot's Up/Down buttons visibly "styled" but empty
+
+- **Symptom (user-reported, 2026-08-17):** with e.g. 4 campaigns filled
+  in, completing/archiving one shifts the remaining 3 up (as designed,
+  §10.4) — but the now-4th (freed) slot doesn't look genuinely empty: its
+  Up/Down cells keep the button-shaped fill + border from
+  `modDesignSystem.ApplyButtonLook`, just with no arrow glyph inside.
+- **Root cause:** `modCampaigns.bas`'s `CompactCampaignSlots` (the
+  routine that squeezes out the gap after an archive, §10.4) clears a
+  freed slot's `.Value` on every cell including Up/Down, but never
+  touched their *formatting* — `ApplyButtonLook`'s fill + 4-side border
+  is direct cell formatting, not tied to the cell having a value, so it
+  survives a value-only clear untouched. This is the fixed-slot
+  architecture's version of a bug class Tasks/Recurring Tasks structurally
+  can't have: their hierarchy engine frees a row via a genuine
+  `Rows.Delete` (CascadeDelete), so a vacated row's formatting scrolls
+  away with the deleted row instead of needing to be explicitly reset.
+  Campaigns never deletes real rows (module header comment: would
+  misalign every subsequent slot's hardcoded positions), so
+  "un-styling" a freed slot has to be done explicitly.
+- **Fix (source):** added `modDesignSystem.ClearButtonLook` — the
+  explicit undo of `ApplyButtonLook`: `Interior.Pattern = xlNone`, top/
+  left/right borders `= xlNone`, bottom border reset to the plain hairline
+  every table-body cell gets at build time
+  (`sheets/design_system.py`'s `apply_table_hairline_borders`, style
+  "hair", `COLOR_GRIDLINE`) — i.e. restores the exact look of a slot that
+  was never occupied. Called on the Up/Down cells inside
+  `CompactCampaignSlots`'s existing "clear every slot" loop, right next
+  to the `.Value = ""` lines it was missing all along.
+- **Testing:** live COM test (4 campaigns typed in via the real
+  `HandleCampaignNameChange` entry point, one completed via
+  `HandleStatusChange` → `ArchiveCampaign` → `CompactCampaignSlots`,
+  exactly the real user flow) — confirmed the freed slot's Up/Down cells
+  read back `Interior.Pattern = xlNone` and only a bottom border after
+  the fix (both `-4142`/xlNone before the value-clear, `1`/xlContinuous
+  only on the bottom edge — matching a genuinely never-occupied slot),
+  while the still-occupied slot that shifted into a new position kept
+  full button styling on all 4 edges. Root-caused and fixed directly from
+  code reading (the bug was unambiguous once `CompactCampaignSlots` was
+  read against `ApplyButtonLook`'s own contract), then verified live per
+  the project's standing rule for any fill/border change (`CLAUDE.md`'s
+  CF-fill gotchas are a reminder that formatting bugs are exactly the
+  class that looks right on paper and wrong in real Excel).
+- **Status:** fixed and COM-tested (2026-08-17); shipped in the V3
+  rebuild (§21) rather than as a laptop line-edit, since the whole file
+  is being replaced.
 
 <!-- Bugs will be appended below as they're reported and diagnosed. -->
+
+## 21. V2 → V3 migration (delivery-model change, 2026-08-17)
+
+### 21.1 Why
+
+The user's real, actively-used workbook (referred to throughout this
+section as "V2") is a separate copy on a work laptop that this repo/build
+machine cannot see (§20's opening note). Post-handoff work up through
+Bug #10 assumed that copy would keep being patched forever via manual
+line-edits/module-pastes (PROGRESS.md's "Fixes given ... awaiting the
+user's confirmation" table). That model hit a hard wall: V2's Tasks sheet
+reached its row ceiling, and rather than keep bolting fixes onto an
+increasingly-patched live file, the user asked for a **freshly rebuilt
+workbook** (called "V3" in conversation — not a literal file name) built
+from this repo's current, fully-fixed source, plus a way to bring their
+real data across **without that data ever leaving their machine or
+passing through this session** (explicitly confidential/internal-network-
+only, confirmed by the user).
+
+### 21.2 What V3 is
+
+Just a normal rebuild: `python build_dashboard.py && python inject_vba.py`
+against this repo's current source — the same two commands that have
+always produced the committed template, now including every fix through
+Bug #11 plus the migration tool itself (§21.3). There is no separate "V3
+build path" — "V3" only means "a fresh rebuild, handed to the user to
+replace their laptop copy with," as opposed to the old model of manually
+patching the existing live file in place.
+
+### 21.3 The migration tool (`vba/modMigration.bas`)
+
+Ships in every build from now on (added to `inject_vba.py`'s
+`STANDARD_MODULES`) as a permanent, re-runnable "Import from a previous
+workbook" utility — not a disposable one-shot script, since the same
+need (a future re-handoff, a corrupted file, a second machine) could
+plausibly recur. Entry point: `MigrateFromV2` (Alt+F8 on the user's
+laptop, run once against the fresh V3 file with their real data in the
+old one).
+
+**Mechanism:**
+1. Confirms with the user via `MsgBox`, then `Application.GetOpenFilename`
+   to pick the old file. Opens it `ReadOnly:=True`, never writes to it,
+   closes it `SaveChanges:=False` when done.
+2. For each sheet, resolves every needed column by **scanning the header
+   row for its literal text** (`FindColumnByHeaderText`, a fixed
+   generous column bound — never `.End()`, for the same hidden-column
+   reason `modCalendarHandoff.bas`'s `FindColumnByHeader` bug is
+   documented in `CLAUDE.md`) in BOTH the old and new workbook
+   independently, rather than assuming matching column positions. This
+   is what makes it tolerant of the old file being an older, pre-fix
+   schema (confirmed with the user: V2 is close to the original handoff,
+   few/none of §20's fixes applied) without needing to know its exact
+   shape in advance.
+3. **Hierarchy sheets (Tasks, Recurring Tasks):** copies only the truly
+   position-independent fields — visible user input (Task, Priority,
+   Deadline, Status, Notes, etc.) plus the three hidden identity fields
+   that actually matter (stable key, parent key, sibling order).
+   Deliberately does NOT copy ID, Level, or Subtask-of display text:
+   reading `modHierarchy.RenumberHierarchy` itself confirms it overwrites
+   all three unconditionally from a fresh walk of the parent-key tree, so
+   migrating stale copies of them would just be thrown away. After the
+   raw copy, calls the same finishing sequence any other bulk structural
+   change already uses (`RenumberHierarchy` → `RefreshButtonStyling` →
+   `RefreshLinkedCampaignLabels`) to rebuild everything else from those
+   three fields alone. Tasks' capacity is grown first via the already-
+   tested row extender (`modTasks.ExtendTaskRows`, Bug #10) rather than
+   writing new capacity logic — looped until there's headroom, capped at
+   50 iterations as a runaway guard. Recurring Tasks has no such
+   extender (its 100-row allowance is meant to comfortably fit a curated
+   template list, not grow); migration fills what fits and reports an
+   overflow warning rather than silently spilling into row 101+.
+4. **Campaigns:** neither a hierarchy sheet nor a growing Table — a fixed
+   20-slot layout (`modCampaigns.bas`'s own header comment) — so main
+   rows are copied slot-by-slot (skipping empty slots, packing
+   occupied ones from slot 1), then `modCampaigns.CompactCampaignSlots`
+   itself is reused to apply real button styling and rebuild the
+   dropdown mirror, exactly as if the user had typed each campaign in
+   by hand. Overflow (more than 20 real campaigns in the old file) is
+   reported, not silently dropped past slot 20.
+5. **Flat Table sheets** (Archive, Campaigns Archive, Login Information,
+   Quick Links, Schedule Data's `WorkLocationTable`/`MeetingsTable`) share
+   one generic routine (`MigrateFlatTable`), reusing the project's
+   established "minimum valid size" convention (`NextTableRow`: reuse the
+   pre-built first blank `ListRow` before ever calling `ListRows.Add`) so
+   the first row doesn't end up permanently blank the way earlier phases
+   found for Archive/Schedule Data/Campaigns Archive (`CLAUDE.md`'s own
+   "recurring architectural patterns" note).
+6. Every stage logs into a module-level `gMigrationLog` string (rows
+   migrated, any expected-but-missing header columns, any overflow),
+   shown in one final summary `MsgBox` — never silently drops data
+   without saying so.
+7. Migration scope, per the user's explicit choice (2026-08-17): Tasks +
+   Archive, Campaigns + Campaigns Archive, Recurring Tasks templates,
+   Schedule Data, Login Information, Quick Links. **Not migrated**: Time
+   Log (internal-only usage tracking, not user data), Monthly Media Plan
+   (not requested — can be added the same way later if the user wants
+   it), Calendar/Schedule (pure live views with no independent storage
+   of their own).
+
+**Testing:** COM tests are the only way to safely validate a tool that
+touches (simulated) real user data, per `CLAUDE.md`'s standing rule — and
+this one especially so, given the confidentiality constraint means it can
+never be tested against the user's *actual* file. Built a realistic
+synthetic "V2" fixture instead of a simplified stand-in
+(`CLAUDE.md`'s own lesson from the Bug #10 row-extender's first failed
+test): extracted `sheets/*.py` **from this repo's very first commit**
+(confirmed via `git diff` to be schema-identical to current source except
+Tasks' row allowance and one Campaigns literal — i.e. genuinely
+representative of "V2, close to original handoff"), built it with no VBA
+(irrelevant — migration only ever reads worksheet *values* over COM,
+never calls V2's own macros), and hand-populated it with synthetic tasks
+(including a parent/subtask pair), an archived task, two campaigns, an
+archived campaign, a recurring task, logins, quick links, and schedule
+data. Ran the real entry points (`HandleCampaignNameChange`,
+`HandleStatusChange`, then the migration subs in the same order
+`MigrateFromV2` uses) against this fixture and verified every field
+landed correctly, hierarchy fully re-derived (subtask nested at ID
+"1.1", level 1, "Subtask of" showing "1"), and Campaigns' Up/Down cells
+came out genuinely button-styled (`Interior.Pattern = 1`) — incidentally
+re-confirming Bug #11's fix under real conditions, not just its own
+isolated test. Found and fixed one new gotcha along the way (documented
+in `CLAUDE.md`): `Application.Run` needs the macro fully qualified with
+the host workbook's name once a second workbook is open — the migration
+tool's own in-VBA calls between its Subs are unaffected (ordinary same-
+project calls, never routed through `Application.Run`), only the test
+harness needed the fix.
+
+**Real-world result (2026-08-17, same day):** V3 itself confirmed working
+on the laptop (Bug #11, formula bar, Notes-icon guards, all checked out).
+`MigrateFromV2` did NOT work against the user's real V2 file — errored
+immediately after picking it; user re-entered their data by hand instead
+and, for now, declined to re-run it to capture the exact error text.
+Re-tested with a considerably more realistic fixture than the original
+(a genuine macro-enabled old-schema `.xlsm`, built by injecting the
+*original handoff commit's* full VBA project — not just plain openpyxl
+data — with two workbooks open simultaneously) via a new test-only entry
+point, `MigrateFromV2Test` (mirrors `MigrateFromV2` exactly minus its two
+dialogs). Still completed cleanly both times. **Status: open,
+unreproduced bug** — see PROGRESS.md for the next-session plan (ask the
+user to retry on a throwaway V3 copy and report the exact
+`Err.Number`/`Err.Description`, since further blind fixing isn't
+productive without it).
+
+### 21.4 Row-extender / Dashboard-scaling audit (user-requested, 2026-08-17)
+
+Before building the above, re-audited whether Bug #10's row extender
+(`modTasks.ExtendTaskRows`) truly keeps everything that reads Tasks in
+sync, since the user asked explicitly: "if we are going to have a button
+for extending the rows, all other things should be able to work with the
+new information — like Dashboard." Traced every remaining hardcoded
+reference to Tasks' old fixed bound (`501`) across `vba/*.bas`: found
+none outside `modTasks.bas` itself (where `501` only appears once more,
+correctly, as the bootstrap's initial value) — `modCampaigns.bas`'s own
+former hardcoded bound was already converted to read `TasksRowAllowance`
+directly as part of Bug #10, and `modRecurringTasks.bas`'s generated-
+instance insertion point (`ProcessTemplate`/`GenerateInstance`) already
+finds its target row via `modHierarchy.LastHierarchyRow` (a live scan,
+not a stored bound) rather than any hardcoded row number, so it already
+scales for free. `ExtendTaskRows`'s own `ReplaceRowBound` (a sheet-wide
+literal-substring replace of the old bound, scoped to Dashboard and
+Campaigns) was already comprehensive per Bug #10's original design and
+COM test suite. **Conclusion: no additional fix was needed** — Bug #10
+already satisfies this requirement; this audit exists in PLAN.md mainly
+so a future session doesn't have to re-derive that from scratch.

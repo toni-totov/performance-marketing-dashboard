@@ -557,9 +557,15 @@ Public Sub ComputeScheduledDates(recurrence As String, taskStartOn As String, fr
     Dim d As Date
     Select Case recurrence
         Case "Daily"
+            ' Weekdays only (user-reported/confirmed): a work task tracker
+            ' has no use for Saturday/Sunday occurrences, which the user
+            ' had to delete by hand every week -- "Daily" now means
+            ' Mon-Fri, not every calendar day.
             For d = fromDate To throughDate
-                outCount = outCount + 1
-                outDates(outCount) = d
+                If Weekday(d, vbMonday) <= 5 Then
+                    outCount = outCount + 1
+                    outDates(outCount) = d
+                End If
             Next d
         Case "Weekly"
             Dim targetWeekday As Long

@@ -38,6 +38,18 @@ Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean
                 modCampaigns.HandleCampaignDoubleClick Target.Row
                 Cancel = True
             End If
+        Case 7    ' End Date on a main row (no special handling), but on a
+                   ' summary data row this position is reused to mirror the
+                   ' linked task's Notes icon (sheets/campaigns.py) -- user-
+                   ' reported: double-clicking it used to do nothing.
+                   ' ResolveMiniListTaskNotesCell returns Nothing for a main/
+                   ' header row or an unlinked slot, so this is a no-op there.
+            Dim mirroredNotesCell As Range
+            Set mirroredNotesCell = modCampaigns.ResolveMiniListTaskNotesCell(Target.Row)
+            If Not mirroredNotesCell Is Nothing Then
+                frmNotes.ShowForCell mirroredNotesCell
+                Cancel = True
+            End If
         Case 9    ' Notes
             frmNotes.ShowForCell Target
             Cancel = True

@@ -36,6 +36,24 @@ Private Const SUMMARY_ROWS_PER_SLOT As Long = 8
 
 Private Const ARCHIVE_COL_CAMPAIGN_KEY As Long = 8
 
+' --- Tasks column layout (sheets/tasks.py), needed only to resolve a
+' mini-list summary row's Notes icon back to its real Tasks row -- see
+' ResolveMiniListTaskNotesCell ---
+Private Const TASKS_COL_NOTES As Long = 16
+Private Const TASKS_COL_CAMPAIGN_RANK_KEY As Long = 26
+Private Const TASKS_FIRST_DATA_ROW As Long = 2
+
+' Was a hardcoded Const (1500) -- converted to a Function reading the
+' "TasksRowAllowance" workbook Defined Name (sheets/tasks.py's build-time
+' bootstrap; modTasks.bas's row extender keeps it current on every +500
+' run) so this bound never needs a manual VBA-source patch again. Same
+' Const-to-Function pattern already used for the ChrW()-built icon
+' constants in modDesignSystem.bas -- a zero-arg Function is called
+' identically to a Const at every existing call site below.
+Private Function TASKS_LAST_DATA_ROW() As Long
+    TASKS_LAST_DATA_ROW = CLng(Application.Evaluate("TasksRowAllowance"))
+End Function
+
 Private Function CampaignsSheet() As Worksheet
     Set CampaignsSheet = ThisWorkbook.Sheets("Campaigns")
 End Function
@@ -215,6 +233,14 @@ Public Function CompactCampaignSlots() As String
         ws.Cells(r, COL_CAMPAIGN_KEY).Value = ""
         ws.Cells(r, COL_UP).Value = ""
         ws.Cells(r, COL_DOWN).Value = ""
+        ' User-reported (PLAN.md §20): clearing the Up/Down cells' VALUES
+        ' above does nothing to the button-shaped FORMATTING ApplyButtonLook
+        ' left behind (fill + 4-side border) -- a slot that goes from
+        ' occupied to empty during compaction kept looking like a live
+        ' button with nothing in it. Reset the formatting too, not just the
+        ' text.
+        modDesignSystem.ClearButtonLook ws.Cells(r, COL_UP)
+        modDesignSystem.ClearButtonLook ws.Cells(r, COL_DOWN)
         ws.Rows((r + 1) & ":" & (r + 1 + SUMMARY_ROWS_PER_SLOT)).Hidden = True
     Next slot
 
@@ -441,6 +467,57 @@ Public Function HandleCampaignDoubleClick(r As Long) As String
     Exit Function
 ErrHandler:
     HandleCampaignDoubleClick = "ERROR " & Err.Number & ": " & Err.Description
+End Function
+
+' A summary row's Notes icon (reused Status-column position, see
+' sheets/campaigns.py's module docstring) is a read-only formula mirror
+' of the matching linked task's real Notes cell on Tasks -- double-
+' clicking it used to do nothing (user-reported), since Campaigns.bas had
+' no dispatcher branch for that column, and even if it had, writing into
+' the formula cell itself would corrupt it. This resolves row `r` back to
+' the actual Tasks!Notes cell it mirrors, using the exact same
+' CampaignKey&"|"&N / CampaignRankKey match the display formula itself
+' uses (sheets/campaigns.py's target_key/rank_key_range), so the two can
+' never disagree. Returns Nothing if `r` isn't a valid summary data row,
+' the slot has no campaign yet, or there's no linked task at that
+' position (blank cell / the "+N more" overflow row).
+Public Function ResolveMiniListTaskNotesCell(r As Long) As Range
+    On Error GoTo ErrHandler
+
+    Dim ws As Worksheet
+    Set ws = CampaignsSheet()
+
+    Dim mainRow As Long
+    mainRow = FIRST_DATA_ROW + Int((r - FIRST_DATA_ROW) / SLOT_SIZE) * SLOT_SIZE
+
+    Dim n As Long
+    n = r - (mainRow + 1)   ' mainRow+1 is the mini header row; data rows start at mainRow+2
+    If n < 1 Or n > SUMMARY_ROWS_PER_SLOT Then Exit Function
+
+    Dim campaignKey As String
+    campaignKey = Trim$(ws.Cells(mainRow, COL_CAMPAIGN_KEY).Value & "")
+    If Len(campaignKey) = 0 Then Exit Function
+
+    Dim targetKey As String
+    targetKey = campaignKey & "|" & n
+
+    Dim tasksWs As Worksheet
+    Set tasksWs = ThisWorkbook.Sheets("Tasks")
+    Dim rankKeyRange As Range
+    Set rankKeyRange = tasksWs.Range( _
+        tasksWs.Cells(TASKS_FIRST_DATA_ROW, TASKS_COL_CAMPAIGN_RANK_KEY), _
+        tasksWs.Cells(TASKS_LAST_DATA_ROW, TASKS_COL_CAMPAIGN_RANK_KEY))
+
+    Dim matchResult As Variant
+    matchResult = Application.Match(targetKey, rankKeyRange, 0)
+    If IsError(matchResult) Then Exit Function
+
+    Dim taskRow As Long
+    taskRow = TASKS_FIRST_DATA_ROW + CLng(matchResult) - 1
+    Set ResolveMiniListTaskNotesCell = tasksWs.Cells(taskRow, TASKS_COL_NOTES)
+    Exit Function
+ErrHandler:
+    ' Resolution failure just means "nothing to open" -- never propagate.
 End Function
 
 Public Function HandleStatusChange(r As Long) As String

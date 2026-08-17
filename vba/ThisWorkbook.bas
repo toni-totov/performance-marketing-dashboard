@@ -51,25 +51,13 @@ End Sub
 Private Sub Workbook_BeforeClose(Cancel As Boolean)
     On Error Resume Next
     modSchedule.CancelAllScheduledReminders
-    ' Belt-and-suspenders restore -- see Workbook_Deactivate's own note.
-    ' Closing the LAST open workbook doesn't fire Deactivate first on
-    ' every Excel version, so this is the backstop for that case.
-    Application.DisplayFormulaBar = True
 End Sub
 
-' Modernization pass (§17.10, PLAN.md §19 Phase 6, user-requested):
-' Application.DisplayFormulaBar is a genuine Excel-wide setting, not
-' saved per-workbook -- toggling it in Workbook_Open alone would leak
-' into every OTHER workbook the user has open in the same Excel session.
-' Scoped instead to Activate/Deactivate so the formula bar only
-' disappears while this workbook is the active window, and comes right
-' back the moment focus moves to any other workbook.
-Private Sub Workbook_Activate()
-    On Error Resume Next
-    Application.DisplayFormulaBar = False
-End Sub
-
-Private Sub Workbook_Deactivate()
-    On Error Resume Next
-    Application.DisplayFormulaBar = True
-End Sub
+' The §17.10 modernization pass (PLAN.md §19 Phase 6) used to hide
+' Application.DisplayFormulaBar while this workbook was the active window
+' (via Workbook_Activate/Deactivate) and restore it on Deactivate/
+' BeforeClose. Reverted (user-reported): toggling this Excel-wide setting
+' on window activation was cancelling the OS clipboard's copy/"marching
+' ants" state when switching from another workbook back into this one,
+' breaking copy/paste between them. Formula bar now stays on permanently,
+' like any other workbook.

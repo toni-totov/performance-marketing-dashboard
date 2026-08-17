@@ -175,3 +175,28 @@ Public Sub ApplyButtonLook(targetCell As Range)
         .VerticalAlignment = xlCenter
     End With
 End Sub
+
+' The undo of ApplyButtonLook -- restores a cell to the plain, un-occupied
+' "empty slot" look a build-time cell has before any row/slot ever occupies
+' it: no fill, and only the bottom hairline border every table-body cell
+' gets from sheets/design_system.py's apply_table_hairline_borders (style
+' "hair", COLOR_GRIDLINE, bottom edge only -- top/left/right cleared).
+' Needed anywhere a row/slot can go from occupied back to empty WITHOUT a
+' real Rows.Delete carrying the surrounding blank formatting up with it
+' (Campaigns' fixed-slot CompactCampaignSlots, PLAN.md §20 user-reported --
+' unlike Tasks'/Recurring Tasks' hierarchy engine, which physically deletes
+' rows via CascadeDelete, so a vacated row is never left with stale button
+' styling in the first place).
+Public Sub ClearButtonLook(targetCell As Range)
+    With targetCell
+        .Interior.Pattern = xlNone
+        .Borders(xlEdgeTop).LineStyle = xlNone
+        .Borders(xlEdgeLeft).LineStyle = xlNone
+        .Borders(xlEdgeRight).LineStyle = xlNone
+        With .Borders(xlEdgeBottom)
+            .LineStyle = xlContinuous
+            .Weight = xlHairline
+            .Color = COLOR_GRIDLINE
+        End With
+    End With
+End Sub

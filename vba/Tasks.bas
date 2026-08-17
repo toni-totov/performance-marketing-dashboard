@@ -32,6 +32,18 @@ Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean
     ' dispatcher project-wide even where currently harmless.
     If Target.Row < 2 Then Exit Sub
 
+    ' Row extender banner -- lives one row below the current allowance
+    ' (modTasks.bas's RowExtenderBannerRow), not inside the normal
+    ' FIRST_DATA_ROW..LAST_DATA_ROW data range, so it's checked separately
+    ' and BEFORE the column dispatch below rather than as a Case in it --
+    ' otherwise its anchor column would collide with whichever existing
+    ' Case already owns that column number within the real data rows.
+    If Target.Row = modTasks.RowExtenderBannerRow() And Target.Column = 1 Then
+        modTasks.HandleRowExtenderClick
+        Cancel = True
+        Exit Sub
+    End If
+
     Select Case Target.Column
         Case 2    ' up arrow
             modTasks.HandleSiblingReorder Target.Row, "up"

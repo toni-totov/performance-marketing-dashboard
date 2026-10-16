@@ -16,9 +16,9 @@ Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean
     ' not be excluded (PLAN.md §19 Phase 5).
     If Target.Row < 2 Then Exit Sub
 
-    Select Case Target.Column
-        Case 13   ' Notes
-            frmNotes.ShowForCell Target
-            Cancel = True
-    End Select
+    ' Notes column found by header (V4 reordered Archive, PLAN.md §22.5).
+    If Target.Column = modTasks.ArchiveColumn("Notes") Then
+        frmNotes.ShowForCell Target
+        Cancel = True
+    End If
 End Sub

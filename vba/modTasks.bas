@@ -53,6 +53,16 @@ Private Const COL_CAMPAIGN_SORT_HELPER As Long = 24
 Private Const COL_CAMPAIGN_RANK As Long = 25
 Private Const COL_CAMPAIGN_RANK_KEY As Long = 26
 Private Const COL_FRIENDLY_TIME_SPENT As Long = 27
+' V4 (PLAN.md §22.4): the generating template's RecurringKey, on generated
+' root rows only. A real moved value column, so TasksColMap's LastCol now
+' reaches it -- with 23-27 marked KeepFrom/KeepTo so the formula helpers
+' between are still never rewritten (same reasoning as above).
+Private Const COL_RECURRING_SOURCE_KEY As Long = 28
+' Subtask progress (V4, PLAN.md §22.11): DoneSubtasks is a moved value
+' column (hence LastCol reaches it); Progress is a per-row display formula
+' beyond LastCol, never rewritten by RenumberHierarchy.
+Private Const COL_DONE_SUBTASKS As Long = 29
+Private Const COL_PROGRESS As Long = 30
 
 Private Const FIRST_DATA_ROW As Long = 2
 
@@ -76,7 +86,9 @@ Private Const ROW_EXTENDER_INCREMENT As Long = 500
 Public Function TasksColMap() As HierarchyColumnMap
     Dim m As HierarchyColumnMap
     m.FirstDataRow = FIRST_DATA_ROW
-    m.LastCol = COL_LINKED_CAMPAIGN_KEY
+    m.LastCol = COL_DONE_SUBTASKS
+    m.KeepFromCol = COL_SORT_KEY
+    m.KeepToCol = COL_FRIENDLY_TIME_SPENT
     m.ColID = COL_ID
     m.ColTask = COL_TASK
     m.ColNumSubtasks = COL_NUM_SUBTASKS
@@ -193,6 +205,8 @@ Public Sub RefreshButtonStyling(ws As Worksheet)
             modDesignSystem.ApplyButtonLook ws.Cells(r, COL_UP)
             modDesignSystem.ApplyButtonLook ws.Cells(r, COL_DOWN)
             modDesignSystem.ApplyButtonLook ws.Cells(r, COL_TIMER)
+            modDesignSystem.HideNumberAsTextFlag ws.Cells(r, COL_ID)
+            modDesignSystem.HideNumberAsTextFlag ws.Cells(r, COL_SUBTASK_OF)
         End If
     Next r
 End Sub
@@ -403,8 +417,20 @@ Public Function HandleStatusChange(r As Long) As String
 
     Select Case newStatus
         Case "Completed"
-            CascadeComplete ws, r
+            CascadeArchive ws, r, "Completed"
             HandleStatusChange = "COMPLETED"
+        Case "Skipped"
+            ' V4 (PLAN.md §22.4): same cascade as Completed, recorded as
+            ' Skipped -- never counted as completed on the Dashboard.
+            CascadeArchive ws, r, "Skipped"
+            HandleStatusChange = "SKIPPED"
+        Case "Rescheduled"
+            ' V4: move the deadline via the normal Calendar picker; the
+            ' status itself stays "Rescheduled" as a visible marker.
+            If Len(Trim$(ws.Cells(r, COL_TASK_KEY).Value & "")) > 0 Then
+                HandleDeadlineDoubleClick r
+            End If
+            HandleStatusChange = "RESCHEDULED"
         Case "Delete"
             Dim confirmResult As VbMsgBoxResult
             confirmResult = MsgBox("Delete this task and all its subtasks? This cannot be undone.", vbYesNo + vbExclamation, "Confirm Delete")
@@ -425,6 +451,108 @@ Public Function HandleStatusChange(r As Long) As String
     Exit Function
 ErrHandler:
     HandleStatusChange = "ERROR " & Err.Number & ": " & Err.Description
+End Function
+
+' Adds `amount` to DoneSubtasks on every ancestor of row r (parent,
+' grandparent, ... up to the root), following ParentKey.
+Private Sub CreditAncestors(ws As Worksheet, r As Long, amount As Long)
+    Dim lastRow As Long, i As Long
+    lastRow = LastHierarchyRow(ws, COL_TASK_KEY, FIRST_DATA_ROW)
+    Dim rowByKey As Object
+    Set rowByKey = CreateObject("Scripting.Dictionary")
+    For i = FIRST_DATA_ROW To lastRow
+        If Len(Trim$(ws.Cells(i, COL_TASK_KEY).Value & "")) > 0 Then
+            rowByKey(CStr(CDbl(ws.Cells(i, COL_TASK_KEY).Value))) = i
+        End If
+    Next i
+
+    Dim parentText As String, guard As Long, pr As Long
+    parentText = Trim$(ws.Cells(r, COL_PARENT_KEY).Value & "")
+    Do While Len(parentText) > 0 And guard < 100
+        If Not IsNumeric(parentText) Then Exit Do
+        If Not rowByKey.Exists(CStr(CDbl(parentText))) Then Exit Do
+        pr = rowByKey(CStr(CDbl(parentText)))
+        ws.Cells(pr, COL_DONE_SUBTASKS).Value = Val(ws.Cells(pr, COL_DONE_SUBTASKS).Value & "") + amount
+        parentText = Trim$(ws.Cells(pr, COL_PARENT_KEY).Value & "")
+        guard = guard + 1
+    Loop
+End Sub
+
+' One-off backfill for a freshly migrated file (modMigration, §22.11): an
+' older workbook had no DoneSubtasks, so rebuild each open task's count
+' from Archive -- every Completed/Skipped archived row credits each OPEN
+' ancestor it has, walking up through archived parents too (a sub-subtask
+' archived together with its archived parent still belongs to the open
+' grandparent). Skipped if any counter is already set, so a source that
+' already carried DoneSubtasks is never double-counted. Returns how many
+' tasks received a non-zero count.
+Public Function SeedDoneSubtaskCounters() As Long
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Sheets("Tasks")
+    Dim lastRow As Long, i As Long
+    lastRow = LastHierarchyRow(ws, COL_TASK_KEY, FIRST_DATA_ROW)
+
+    Dim openRow As Object, openParent As Object
+    Set openRow = CreateObject("Scripting.Dictionary")
+    Set openParent = CreateObject("Scripting.Dictionary")
+    For i = FIRST_DATA_ROW To lastRow
+        If Len(Trim$(ws.Cells(i, COL_TASK_KEY).Value & "")) > 0 Then
+            If Len(Trim$(ws.Cells(i, COL_DONE_SUBTASKS).Value & "")) > 0 Then Exit Function
+            Dim k As String
+            k = CStr(CDbl(ws.Cells(i, COL_TASK_KEY).Value))
+            openRow(k) = i
+            openParent(k) = Trim$(ws.Cells(i, COL_PARENT_KEY).Value & "")
+        End If
+    Next i
+
+    Dim aws As Worksheet
+    Set aws = ThisWorkbook.Sheets("Archive")
+    Dim cKey As Long, cParent As Long, cStatus As Long
+    cKey = ArchiveColumn("TaskKey"): cParent = ArchiveColumn("ParentKey"): cStatus = ArchiveColumn("Status")
+    If cKey = 0 Or cParent = 0 Then Exit Function
+    Dim tbl As ListObject
+    Set tbl = aws.ListObjects("ArchiveTable")
+    Dim lastA As Long
+    lastA = tbl.Range.Row + tbl.Range.Rows.Count - 1
+
+    Dim archParent As Object
+    Set archParent = CreateObject("Scripting.Dictionary")
+    For i = 2 To lastA
+        If IsNumeric(aws.Cells(i, cKey).Value) And Len(aws.Cells(i, cKey).Value & "") > 0 Then
+            archParent(CStr(CDbl(aws.Cells(i, cKey).Value))) = Trim$(aws.Cells(i, cParent).Value & "")
+        End If
+    Next i
+
+    Dim credit As Object
+    Set credit = CreateObject("Scripting.Dictionary")
+    For i = 2 To lastA
+        Dim st As String
+        st = ""
+        If cStatus > 0 Then st = Trim$(aws.Cells(i, cStatus).Value & "")
+        If st = "Completed" Or st = "Skipped" Or cStatus = 0 Then
+            Dim p As String, guard As Long
+            p = Trim$(aws.Cells(i, cParent).Value & "")
+            guard = 0
+            Do While Len(p) > 0 And IsNumeric(p) And guard < 100
+                p = CStr(CDbl(p))
+                If openRow.Exists(p) Then
+                    credit(p) = credit(p) + 1
+                    p = openParent(p)
+                ElseIf archParent.Exists(p) Then
+                    p = archParent(p)
+                Else
+                    Exit Do
+                End If
+                guard = guard + 1
+            Loop
+        End If
+    Next i
+
+    Dim key As Variant
+    For Each key In credit.Keys
+        ws.Cells(openRow(key), COL_DONE_SUBTASKS).Value = credit(key)
+    Next key
+    SeedDoneSubtaskCounters = credit.Count
 End Function
 
 ' Collects a task row and every descendant row (ID-prefix match, same
@@ -453,7 +581,10 @@ Private Sub FindBranchRows(ws As Worksheet, r As Long, ByRef outRows() As Long, 
     Next i
 End Sub
 
-Private Sub CascadeComplete(ws As Worksheet, r As Long)
+' Archives a task's whole branch (static values) and removes it from
+' Tasks. finalStatus is "Completed" or "Skipped" (V4, PLAN.md §22.4) --
+' every archived row in the branch is recorded with it.
+Private Sub CascadeArchive(ws As Worksheet, r As Long, finalStatus As String)
     Dim prevEvents As Boolean
     prevEvents = Application.EnableEvents
     Application.EnableEvents = False
@@ -465,17 +596,23 @@ Private Sub CascadeComplete(ws As Worksheet, r As Long)
     Dim completedAt As Date
     completedAt = Now()
 
+    ' Subtask progress (§22.11): every open ancestor gains the whole
+    ' branch (the row plus its descendants), since all of it is resolved.
+    CreditAncestors ws, r, n
+
     Dim archiveWs As Worksheet
     Set archiveWs = ThisWorkbook.Sheets("Archive")
     archiveWs.Unprotect
 
     Dim archTbl As ListObject
     Set archTbl = archiveWs.ListObjects("ArchiveTable")
+    Dim archCols As Object
+    Set archCols = ArchiveHeaderMap(archiveWs)
 
     SortAscending rowsInBranch, n   ' archive in visual (depth-first) order
     Dim k As Long
     For k = 1 To n
-        ArchiveOneRow ws, rowsInBranch(k), archTbl, completedAt
+        ArchiveOneRow ws, rowsInBranch(k), archTbl, completedAt, finalStatus, archCols
     Next k
 
     archiveWs.Protect UserInterfaceOnly:=True
@@ -548,35 +685,141 @@ Private Function NextArchiveRow(archTbl As ListObject) As ListRow
     Set NextArchiveRow = archTbl.ListRows.Add
 End Function
 
-' (PLAN.md §7.1).
-Private Sub ArchiveOneRow(tasksWs As Worksheet, taskRow As Long, archTbl As ListObject, completedAt As Date)
+' Archive's header text -> column number, scanned once per cascade (V4,
+' PLAN.md §22.5). Every write below goes through this instead of fixed
+' column indexes, so Archive's column order can change (and did, in V4)
+' without ever silently writing a value into the wrong column. A manual
+' scan to a fixed bound, never .End(xlToLeft) -- Archive hides columns
+' (CLAUDE.md's hidden-column .End() lesson).
+Private Function ArchiveHeaderMap(archiveWs As Worksheet) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Dim c As Long, h As String
+    For c = 1 To 40
+        h = Trim$(archiveWs.Cells(1, c).Value & "")
+        If Len(h) > 0 And Not d.Exists(h) Then d(h) = c
+    Next c
+    Set ArchiveHeaderMap = d
+End Function
+
+' Column number of an Archive header (0 if absent) -- used by Archive.bas
+' and modDailyLog so nothing outside this module hard-codes Archive's
+' layout.
+Public Function ArchiveColumn(header As String) As Long
+    Dim m As Object
+    Set m = ArchiveHeaderMap(ThisWorkbook.Sheets("Archive"))
+    If m.Exists(header) Then ArchiveColumn = m(header)
+End Function
+
+Private Sub PutArchiveValue(archiveWs As Worksheet, sheetRow As Long, archCols As Object, header As String, v As Variant)
+    If archCols.Exists(header) Then archiveWs.Cells(sheetRow, archCols(header)).Value = v
+End Sub
+
+' (PLAN.md §7.1, §22.4/§22.5).
+Private Sub ArchiveOneRow(tasksWs As Worksheet, taskRow As Long, archTbl As ListObject, completedAt As Date, _
+                          finalStatus As String, archCols As Object)
     Dim newRow As ListRow
     Set newRow = NextArchiveRow(archTbl)
+    Dim aws As Worksheet
+    Set aws = archTbl.Parent
+    Dim ar As Long
+    ar = newRow.Range.Row
 
-    newRow.Range(1, 1).Value = tasksWs.Cells(taskRow, COL_ID).Value
-    newRow.Range(1, 2).Value = tasksWs.Cells(taskRow, COL_START_DATE).Value
-    newRow.Range(1, 3).Value = tasksWs.Cells(taskRow, COL_TASK).Value
-    newRow.Range(1, 4).Value = tasksWs.Cells(taskRow, COL_NUM_SUBTASKS).Value
-    newRow.Range(1, 5).Value = tasksWs.Cells(taskRow, COL_SUBTASK_OF).Value
-    newRow.Range(1, 6).Value = tasksWs.Cells(taskRow, COL_PROJECT).Value
-    newRow.Range(1, 7).Value = tasksWs.Cells(taskRow, COL_LINKED_CAMPAIGN).Value
-    newRow.Range(1, 8).Value = tasksWs.Cells(taskRow, COL_PRIORITY).Value
-    newRow.Range(1, 9).Value = tasksWs.Cells(taskRow, COL_DEADLINE).Value
-    newRow.Range(1, 10).Value = "Completed"
+    PutArchiveValue aws, ar, archCols, "ID", tasksWs.Cells(taskRow, COL_ID).Value
+    PutArchiveValue aws, ar, archCols, "Start Date", tasksWs.Cells(taskRow, COL_START_DATE).Value
+    PutArchiveValue aws, ar, archCols, "Task", tasksWs.Cells(taskRow, COL_TASK).Value
+    PutArchiveValue aws, ar, archCols, "Total Subtasks", tasksWs.Cells(taskRow, COL_NUM_SUBTASKS).Value
+    PutArchiveValue aws, ar, archCols, "Subtask of", tasksWs.Cells(taskRow, COL_SUBTASK_OF).Value
+    PutArchiveValue aws, ar, archCols, "Project / Category", tasksWs.Cells(taskRow, COL_PROJECT).Value
+    PutArchiveValue aws, ar, archCols, "Linked Campaign", tasksWs.Cells(taskRow, COL_LINKED_CAMPAIGN).Value
+    PutArchiveValue aws, ar, archCols, "Priority", tasksWs.Cells(taskRow, COL_PRIORITY).Value
+    PutArchiveValue aws, ar, archCols, "Deadline", tasksWs.Cells(taskRow, COL_DEADLINE).Value
+    PutArchiveValue aws, ar, archCols, "Status", finalStatus
 
+    ' Frozen "days early/late" (§7.1) -- only meaningful for real
+    ' completions; a skipped task was never "late", it just didn't happen.
+    Dim earlyLateHeader As String
+    earlyLateHeader = IIf(archCols.Exists("Early / Late"), "Early / Late", "Days Left")
     Dim deadlineVal As Variant
     deadlineVal = tasksWs.Cells(taskRow, COL_DEADLINE).Value
-    If Len(Trim$(deadlineVal & "")) > 0 Then
-        newRow.Range(1, 11).Value = CDate(deadlineVal) - completedAt   ' frozen "days early/late", §7.1
+    If finalStatus = "Completed" And Len(Trim$(deadlineVal & "")) > 0 Then
+        PutArchiveValue aws, ar, archCols, earlyLateHeader, CDate(deadlineVal) - completedAt
     End If
 
-    newRow.Range(1, 12).Value = tasksWs.Cells(taskRow, COL_TIME_SPENT).Value
-    newRow.Range(1, 13).Value = tasksWs.Cells(taskRow, COL_NOTES).Value
-    newRow.Range(1, 14).Value = completedAt
+    PutArchiveValue aws, ar, archCols, "Time Spent (hrs)", tasksWs.Cells(taskRow, COL_TIME_SPENT).Value
+    PutArchiveValue aws, ar, archCols, "Notes", tasksWs.Cells(taskRow, COL_NOTES).Value
+    PutArchiveValue aws, ar, archCols, "Completed At", completedAt
 
-    newRow.Range(1, 15).Value = tasksWs.Cells(taskRow, COL_TASK_KEY).Value
-    newRow.Range(1, 16).Value = tasksWs.Cells(taskRow, COL_PARENT_KEY).Value
-    newRow.Range(1, 17).Value = tasksWs.Cells(taskRow, COL_LEVEL).Value
+    PutArchiveValue aws, ar, archCols, "TaskKey", tasksWs.Cells(taskRow, COL_TASK_KEY).Value
+    PutArchiveValue aws, ar, archCols, "ParentKey", tasksWs.Cells(taskRow, COL_PARENT_KEY).Value
+    PutArchiveValue aws, ar, archCols, "Level", tasksWs.Cells(taskRow, COL_LEVEL).Value
+
+    FinishArchiveRowWith aws, ar, archCols
+End Sub
+
+' The display-only finishing touches every archived row needs, whether
+' it came from a live cascade or from modMigration (PLAN.md §22.9).
+Public Sub FinishArchiveRow(aws As Worksheet, ar As Long)
+    FinishArchiveRowWith aws, ar, ArchiveHeaderMap(aws)
+End Sub
+
+Private Sub FinishArchiveRowWith(aws As Worksheet, ar As Long, archCols As Object)
+    ' Friendly "1h 30m" display. Written per row (PLAN.md §22.2 #1): it
+    ' used to exist only in Archive's first row, so every later archived
+    ' row showed a blank Time Spent.
+    If archCols.Exists("Time Spent") And archCols.Exists("Time Spent (hrs)") Then
+        Dim hrsRef As String
+        hrsRef = "RC" & archCols("Time Spent (hrs)")
+        aws.Cells(ar, archCols("Time Spent")).FormulaR1C1 = _
+            "=IF(" & hrsRef & "="""","""",TEXT(INT(ROUND(" & hrsRef & "*60,0)/60),""0"")&""h ""&TEXT(MOD(ROUND(" & hrsRef & "*60,0),60),""00"")&""m"")"
+    End If
+    If archCols.Exists("ID") Then modDesignSystem.HideNumberAsTextFlag aws.Cells(ar, archCols("ID"))
+    If archCols.Exists("Subtask of") Then modDesignSystem.HideNumberAsTextFlag aws.Cells(ar, archCols("Subtask of"))
+End Sub
+
+' Archives (as Skipped) every still-open instance of one Recurring Tasks
+' template whose deadline DAY has passed -- "If Missed = Skip" (V4,
+' PLAN.md §22.4). Called from modRecurringTasksWriter on every
+' regeneration run. Date-before-today, not Deadline < Now, so today's
+' 10:00 meeting doesn't disappear at 10:01; a meeting rescheduled to a
+' later day has a future deadline and is left alone. Rows are re-scanned
+' from the top after each cascade, since archiving deletes rows and
+' renumbers the tree. Returns how many instances were skipped.
+Public Function SkipMissedRecurringInstances(sourceKey As Double) As Long
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Sheets("Tasks")
+    Dim skipped As Long
+    Dim guard As Long
+    Do
+        Dim found As Long
+        found = 0
+        Dim lastRow As Long
+        lastRow = LastHierarchyRow(ws, COL_TASK_KEY, FIRST_DATA_ROW)
+        Dim r As Long
+        For r = FIRST_DATA_ROW To lastRow
+            If Len(Trim$(ws.Cells(r, COL_TASK_KEY).Value & "")) > 0 _
+               And Len(Trim$(ws.Cells(r, COL_PARENT_KEY).Value & "")) = 0 _
+               And Val(ws.Cells(r, COL_RECURRING_SOURCE_KEY).Value & "") = sourceKey Then
+                Dim dl As Variant
+                dl = ws.Cells(r, COL_DEADLINE).Value
+                If IsDate(dl) Then
+                    If Int(CDbl(CDate(dl))) < CDbl(Date) Then
+                        found = r
+                        Exit For
+                    End If
+                End If
+            End If
+        Next r
+        If found = 0 Then Exit Do
+        CascadeArchive ws, found, "Skipped"
+        skipped = skipped + 1
+        guard = guard + 1
+    Loop While guard < 1000
+    SkipMissedRecurringInstances = skipped
+End Function
+
+Public Sub WriteRecurringSourceKey(destRow As Long, sourceKey As Double)
+    ThisWorkbook.Sheets("Tasks").Cells(destRow, COL_RECURRING_SOURCE_KEY).Value = sourceKey
 End Sub
 
 ' ============================================================================
@@ -1098,7 +1341,7 @@ Private Sub BuildTaskTemplateRow(ws As Worksheet, r As Long, newLast As Long)
     Dim DQ As String
     DQ = Chr(34)
 
-    ws.Cells(r, COL_START_DATE).NumberFormat = "DD.MM.YYYY HH:MM"
+    ws.Cells(r, COL_START_DATE).NumberFormat = "DD.MM.YYYY"   ' date only (V4, PLAN.md §22.8)
     ws.Cells(r, COL_DEADLINE).NumberFormat = "DD.MM.YYYY HH:MM"
     ws.Cells(r, COL_TIME_SPENT).NumberFormat = "0.00"
     ws.Cells(r, COL_NOTES).NumberFormat = "General;General;General;" & DQ & modDesignSystem.ICON_NOTES() & DQ
@@ -1143,14 +1386,16 @@ Private Sub BuildTaskTemplateRow(ws As Worksheet, r As Long, newLast As Long)
         "=IF(" & lck & "=" & DQ & DQ & "," & DQ & DQ & "," & lck & "&" & DQ & "|" & DQ & "&" & rankCell & ")"
 
     Dim c As Variant
-    For Each c In Array(COL_ID, COL_NUM_SUBTASKS, COL_SUBTASK_OF, COL_DAYS_LEFT, COL_FRIENDLY_TIME_SPENT)
+    ws.Cells(r, COL_PROGRESS).Formula = ProgressFormula(r)
+
+    For Each c In Array(COL_ID, COL_NUM_SUBTASKS, COL_SUBTASK_OF, COL_DAYS_LEFT, COL_FRIENDLY_TIME_SPENT, COL_PROGRESS)
         With ws.Cells(r, CLng(c))
             .HorizontalAlignment = xlCenter
             .VerticalAlignment = xlCenter
         End With
     Next c
 
-    With ws.Range(ws.Cells(r, 1), ws.Cells(r, COL_FRIENDLY_TIME_SPENT)).Borders(xlEdgeBottom)
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, COL_PROGRESS)).Borders(xlEdgeBottom)
         .LineStyle = xlContinuous
         .Weight = xlHairline
         .Color = modDesignSystem.COLOR_GRIDLINE
@@ -1247,17 +1492,35 @@ Private Sub ExtendValidationAndCF(ws As Worksheet, oldLast As Long, newLast As L
     ExtendCFAppliesTo ws, COL_STATUS, COL_STATUS, newLast
     ExtendCFAppliesTo ws, COL_TASK, COL_TASK, newLast                     ' subtask "prefix" rule
     ExtendCFAppliesTo ws, COL_NUM_SUBTASKS, COL_NUM_SUBTASKS, newLast     ' magnitude ramp
-    ExtendCFAppliesTo ws, 1, 16, newLast                                  ' depth shading, A:P
+    ExtendCFAppliesTo ws, 1, 16, newLast                                  ' A: depth shading/today tint (A:P), overdue ID (A only)
+    ExtendCFAppliesTo ws, COL_DEADLINE, COL_DEADLINE, newLast             ' V4 "Today hh:mm" formats
+    ExtendCFAppliesTo ws, COL_LINKED_CAMPAIGN, COL_LINKED_CAMPAIGN, newLast  ' V4 faint "None"
+    ExtendCFAppliesTo ws, COL_PROGRESS, COL_PROGRESS, newLast             ' V4 "all done" green
 End Sub
 
 ' Queries the SINGLE anchor cell (FIRST_DATA_ROW, firstCol) for its
 ' FormatConditions -- reliable per Excel's object model (unlike querying a
 ' large multi-row Range, which is not guaranteed to enumerate every rule
-' that touches it) -- and resizes each one found to FIRST_DATA_ROW..newLast
-' across firstCol..lastCol.
+' that touches it) -- and extends each one found down to newLast, keeping
+' that rule's OWN columns. (V4 fix, PLAN.md §22.8: this used to resize
+' every rule found to firstCol..lastCol, which was harmless while every
+' rule on column A spanned A:P, but would have stretched V4's A-only
+' "overdue ID" red fill across the whole row on the first extension.
+' firstCol/lastCol are now only the anchor; kept in the signature so
+' every call site reads the same as before.)
+' Same text as sheets/tasks.py's progress_formula (keep the two in step).
+' Glyphs via ChrW -- VBA source is ANSI (CLAUDE.md).
+Private Function ProgressFormula(r As Long) As String
+    Dim done As String, openN As String, total As String, filled As String
+    done = "N($AC" & r & ")"
+    openN = "IF($F" & r & "="""",0,$F" & r & ")"
+    total = "(" & done & "+" & openN & ")"
+    filled = "ROUND(" & done & "/" & total & "*5,0)"
+    ProgressFormula = "=IF(OR($Q" & r & "=""""," & total & "=0),""""," & _
+        done & "&""/""&" & total & "&""  ""&REPT(""" & ChrW(9619) & """," & filled & ")&REPT(""" & ChrW(9617) & """,5-" & filled & "))"
+End Function
+
 Private Sub ExtendCFAppliesTo(ws As Worksheet, firstCol As Long, lastCol As Long, newLast As Long)
-    Dim newRange As Range
-    Set newRange = ws.Range(ws.Cells(FIRST_DATA_ROW, firstCol), ws.Cells(newLast, lastCol))
 
     ' Direct iteration -- confirmed live via COM (scratchpad debug probes,
     ' this session) that snapshotting each FormatCondition into a
@@ -1275,7 +1538,15 @@ Private Sub ExtendCFAppliesTo(ws As Worksheet, firstCol As Long, lastCol As Long
     Dim n As Long, i As Long
     n = srcConditions.Count
     For i = 1 To n
-        srcConditions.Item(i).ModifyAppliesToRange newRange
+        Dim cur As Range, area As Range, grown As Range
+        Set cur = srcConditions.Item(i).AppliesTo
+        Set grown = Nothing
+        For Each area In cur.Areas
+            Dim one As Range
+            Set one = ws.Range(ws.Cells(FIRST_DATA_ROW, area.Column), ws.Cells(newLast, area.Column + area.Columns.Count - 1))
+            If grown Is Nothing Then Set grown = one Else Set grown = Union(grown, one)
+        Next area
+        srcConditions.Item(i).ModifyAppliesToRange grown
     Next i
 End Sub
 

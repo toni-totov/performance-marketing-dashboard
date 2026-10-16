@@ -53,6 +53,8 @@ STATUS_GOOD = "0CA30C"
 STATUS_WARNING = "FAB219"
 STATUS_SERIOUS = "EC835A"
 STATUS_CRITICAL = "D03B3B"
+WARNING_SOFT = "FCE7B3"
+GRIDLINE_DARK = "BDBBB5"       # faint placeholder text, e.g. Linked Campaign "None" (V4)        # pale amber -- "soon", one step below STATUS_WARNING (V4, PLAN.md §22.8)
 
 # Priority (Tasks, Recurring Tasks): Low/Medium/High -> good/warning/critical
 PRIORITY_LOW = STATUS_GOOD
@@ -78,6 +80,8 @@ CARD_SURFACE = "FCFCFB"        # KPI/stat card surface
 WORKFLOW_NOT_STARTED = INK_MUTED       # Tasks "Not Started", Campaigns "Planned"
 WORKFLOW_IN_MOTION = CATEGORICAL[0]    # Tasks "In Progress", Campaigns "Active"
 WORKFLOW_DONE = STATUS_GOOD            # Completed
+WORKFLOW_SKIPPED = "D3D1CB"            # Tasks "Skipped" (V4, PLAN.md §22.4) -- lighter than Not Started: "won't happen"
+WORKFLOW_RESCHEDULED = STATUS_SERIOUS  # Tasks "Rescheduled" (V4) -- orange: moved, still needs doing
 
 WORKFLOW_ACTIVE = STATUS_GOOD          # Recurring Tasks / Schedule Meetings
 WORKFLOW_INACTIVE = INK_MUTED

@@ -8,10 +8,12 @@ __pycache__/
 # Build/test scratch artifacts
 _smoketest_cf.xlsx
 
-# Intermediate build output (no VBA yet) -- Performance Marketing Dashboard.xlsm
-# is the real deliverable and is committed; the .xlsx is a throwaway
-# structure-only step produced along the way by build_dashboard.py.
+# Intermediate build output (no VBA yet) -- the .xlsm is the real
+# deliverable and is committed; the .xlsx is a throwaway structure-only
+# step produced along the way by build_dashboard.py. Same reasoning for
+# both variants (PLAN.md, "Manager-variant workbook" §1/§8).
 Performance Marketing Dashboard.xlsx
+Task Tracker - Manager.xlsx
 
 # Personal working copies -- never publish a copy that may contain real
 # task/campaign/login data typed in by hand.

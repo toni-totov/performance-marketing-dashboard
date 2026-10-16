@@ -79,6 +79,7 @@ Public Sub GoToPrevMonth()
     End If
     ws.Range("ScheduleYear").Value = y
     ws.Range("ScheduleMonth").Value = m
+    RenderScheduleBadges
 End Sub
 
 Public Sub GoToNextMonth()
@@ -94,6 +95,7 @@ Public Sub GoToNextMonth()
     End If
     ws.Range("ScheduleYear").Value = y
     ws.Range("ScheduleMonth").Value = m
+    RenderScheduleBadges
 End Sub
 
 Public Sub GoToToday()
@@ -101,6 +103,7 @@ Public Sub GoToToday()
     Set ws = ScheduleSheet()
     ws.Range("ScheduleYear").Value = Year(Date)
     ws.Range("ScheduleMonth").Value = Month(Date)
+    RenderScheduleBadges
 End Sub
 
 ' ============================================================================
@@ -149,6 +152,7 @@ Public Sub UpsertWorkLocation(targetDate As Date, locationText As String)
     End If
 
     Application.EnableEvents = prevEvents
+    RenderScheduleBadges   ' day-cell labels follow the data (V4)
 End Sub
 
 Public Sub AddMeeting(meetingName As String, startTime As Date, endTime As Date, recurrence As String, anchorDate As Date)
@@ -173,6 +177,7 @@ Public Sub AddMeeting(meetingName As String, startTime As Date, endTime As Date,
     newRow.Range(1, 7).Value = NextMeetingKey()
 
     Application.EnableEvents = prevEvents
+    RenderScheduleBadges   ' day-cell labels follow the data (V4)
 End Sub
 
 Private Function NextMeetingKey() As Double
@@ -225,6 +230,7 @@ Public Sub DeleteMeetingByKey(meetingKey As Double)
     Next r
 
     Application.EnableEvents = prevEvents
+    RenderScheduleBadges   ' day-cell labels follow the data (V4)
 End Sub
 
 ' True if targetDate's Work Location is Holiday/Sick/Out of Office (an
@@ -264,40 +270,138 @@ End Function
 ' Shared by frmScheduleDay's LoadMeetings and CollectDueReminders below
 ' -- see module header comment for why this isn't duplicated.
 Public Function MeetingOccursOn(ws As Worksheet, r As Long, targetDate As Date) As Boolean
+    MeetingOccursOn = MeetingPatternMatches(ws, r, targetDate)
+    If MeetingOccursOn Then
+        If Trim$(ws.Cells(r, MT_COL_RECURRENCE).Value & "") <> "One-time" Then
+            If IsExcludedDay(targetDate) Then MeetingOccursOn = False
+        End If
+    End If
+End Function
+
+' MeetingOccursOn minus the Holiday/Sick/Out-of-Office exclusion -- split
+' out so RenderScheduleBadges can check exclusion once per day from a
+' prebuilt set instead of rescanning Work Location for every meeting.
+' The two must stay in agreement; MeetingOccursOn is defined in terms of
+' this one.
+Private Function MeetingPatternMatches(ws As Worksheet, r As Long, targetDate As Date) As Boolean
+    Dim matches As Boolean
     Dim recurrence As String, status As String
     recurrence = Trim$(ws.Cells(r, MT_COL_RECURRENCE).Value & "")
     status = Trim$(ws.Cells(r, MT_COL_STATUS).Value & "")
 
     If recurrence = "One-time" Then
-        MeetingOccursOn = (CLng(ws.Cells(r, MT_COL_ANCHOR_DATE).Value) = CLng(targetDate))
+        matches = (CLng(ws.Cells(r, MT_COL_ANCHOR_DATE).Value) = CLng(targetDate))
     ElseIf status = "Active" Then
         Dim anchorDate As Date
         anchorDate = ws.Cells(r, MT_COL_ANCHOR_DATE).Value
+        ' A recurring meeting starts on its Anchor Date -- never projected
+        ' backwards onto earlier dates (PLAN.md §22.2 #3). Same gate as
+        ' the Schedule badge formula (sheets/schedule.py).
+        If Int(targetDate) < Int(anchorDate) Then
+            MeetingPatternMatches = False
+            Exit Function
+        End If
         Select Case recurrence
             Case "Daily"
-                MeetingOccursOn = True
+                matches = True
             Case "Weekdays"
                 ' User-requested addition (PLAN.md §19 Phase 5): a
                 ' separate recurrence type from "Daily" (which keeps its
                 ' exact original every-day-including-weekends meaning),
                 ' restricted to Monday-Friday. vbMonday-based Weekday()
                 ' returns 1=Monday..7=Sunday, so <=5 covers Mon-Fri.
-                MeetingOccursOn = (Weekday(targetDate, vbMonday) <= 5)
+                matches = (Weekday(targetDate, vbMonday) <= 5)
             Case "Weekly"
-                MeetingOccursOn = (Weekday(anchorDate, vbMonday) = Weekday(targetDate, vbMonday))
+                matches = (Weekday(anchorDate, vbMonday) = Weekday(targetDate, vbMonday))
             Case "Monthly"
-                MeetingOccursOn = (Day(anchorDate) = Day(targetDate))
+                matches = (Day(anchorDate) = Day(targetDate))
             Case Else
-                MeetingOccursOn = False
+                matches = False
         End Select
 
-        If MeetingOccursOn And IsExcludedDay(targetDate) Then
-            MeetingOccursOn = False
-        End If
     Else
-        MeetingOccursOn = False
+        matches = False
     End If
+    MeetingPatternMatches = matches
 End Function
+
+' ============================================================================
+' Day-cell meeting labels (V4, PLAN.md §22.8)
+' ============================================================================
+
+' Each day cell's badge row used to be a formula counting meetings ("• 2").
+' It now shows the day's first meeting -- "10:00 Stand-up", plus "+N" when
+' there are more -- which needs the meeting NAME in time order, beyond
+' what a legacy-safe formula can pick out. Written as plain text into the
+' badge row; called after every month navigation, every meeting/location
+' change and on Workbook_Open (via GoToToday).
+Public Sub RenderScheduleBadges()
+    On Error GoTo ErrHandler
+    Dim sch As Worksheet, sd As Worksheet
+    Set sch = ScheduleSheet()
+    Set sd = ThisWorkbook.Sheets("Schedule Data")
+
+    ' Away days (Holiday/Sick/Out of Office) once, not per meeting.
+    Dim away As Object
+    Set away = CreateObject("Scripting.Dictionary")
+    Dim lastWL As Long, r As Long
+    lastWL = modHierarchy.LastHierarchyRow(sd, WL_COL_DATE, WL_FIRST_DATA_ROW)
+    For r = WL_FIRST_DATA_ROW To lastWL
+        If IsDate(sd.Cells(r, WL_COL_DATE).Value) Then
+            Dim loc As String
+            loc = Trim$(sd.Cells(r, WL_COL_LOCATION).Value & "")
+            If loc = "Holiday" Or loc = "Sick" Or loc = "Out of Office" Then away(CLng(CDate(sd.Cells(r, WL_COL_DATE).Value))) = True
+        End If
+    Next r
+
+    Dim lastMT As Long
+    lastMT = modHierarchy.LastHierarchyRow(sd, MT_COL_MEETING_NAME, MT_FIRST_DATA_ROW)
+
+    Dim w As Long, c As Long
+    For w = 0 To 5
+        Dim dRow As Long
+        dRow = 3 + w * 2
+        For c = 1 To 7
+            Dim dayLabel As String
+            dayLabel = ""
+            Dim v As Variant
+            v = sch.Cells(dRow, c).Value
+            If IsDate(v) Then
+                Dim d As Date
+                d = CDate(v)
+                Dim cnt As Long, bestT As Double, bestName As String
+                cnt = 0: bestT = 99: bestName = ""
+                For r = MT_FIRST_DATA_ROW To lastMT
+                    If Len(Trim$(sd.Cells(r, MT_COL_MEETING_NAME).Value & "")) > 0 Then
+                        If MeetingPatternMatches(sd, r, d) Then
+                            Dim isOneTime As Boolean
+                            isOneTime = (Trim$(sd.Cells(r, MT_COL_RECURRENCE).Value & "") = "One-time")
+                            If isOneTime Or Not away.Exists(CLng(d)) Then
+                                cnt = cnt + 1
+                                Dim t As Double
+                                t = CDbl(sd.Cells(r, MT_COL_START_TIME).Value)
+                                t = t - Int(t)
+                                If t < bestT Then
+                                    bestT = t
+                                    bestName = sd.Cells(r, MT_COL_MEETING_NAME).Value & ""
+                                End If
+                            End If
+                        End If
+                    End If
+                Next r
+                If cnt > 0 Then
+                    Dim mins As Long
+                    mins = CLng(Round(bestT * 1440, 0))
+                    dayLabel = Format(mins \ 60, "00") & ":" & Format(mins Mod 60, "00") & " " & bestName
+                    If cnt > 1 Then dayLabel = dayLabel & " +" & (cnt - 1)
+                End If
+            End If
+            sch.Cells(dRow + 1, c).Value = dayLabel
+        Next c
+    Next w
+    Exit Sub
+ErrHandler:
+End Sub
 
 ' ============================================================================
 ' Reminders (§13.5)

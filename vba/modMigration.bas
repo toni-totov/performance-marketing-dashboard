@@ -9,7 +9,8 @@ Option Explicit
 ' PLAN.md §20's fixes). Everything happens locally in the Excel process
 ' the user already has open: the old file is opened read-only and closed
 ' without saving, nothing is written back to it, nothing leaves this
-' machine. Entry point: MigrateFromV2 (Alt+F8).
+' machine. Entry point: MigrateFromPrevious (Alt+F8; the old name
+' MigrateFromV2 still works).
 '
 ' Design: hierarchy sheets (Tasks, Recurring Tasks) only need their
 ' TRULY position-independent identity fields copied verbatim (stable key,
@@ -32,6 +33,8 @@ Option Explicit
 Private Const HEADER_SCAN_MAX_COL As Long = 60
 
 Public gMigrationLog As String
+Public gMigrationRow As Long
+Public gMigrationHadError As Boolean
 
 ' Test-only accessor -- Application.Run can't read a Public module
 ' variable directly, only call a Function/Sub.
@@ -59,23 +62,14 @@ Public Function MigrateFromV2Test(srcPath As String) As String
     Dim srcWb As Workbook
     Set srcWb = Workbooks.Open(srcPath, ReadOnly:=True, UpdateLinks:=0)
 
-    MigrateTasksAndArchive srcWb
-    MigrateCampaignsAndArchive srcWb
-    MigrateRecurringTasks srcWb
-    MigrateFlatTable srcWb, "Login Information", "LoginInformationTable", _
-        Array("Platform", "Website", "Username / Email", "Password", "Last Password Change", "Access", "Notes")
-    MigrateFlatTable srcWb, "Quick Links", "QuickLinksTable", _
-        Array("Category / Group", "Link / URL", "Description", "Notes")
-    MigrateFlatTable srcWb, "Schedule Data", "WorkLocationTable", Array("Date", "Location")
-    MigrateFlatTable srcWb, "Schedule Data", "MeetingsTable", _
-        Array("Meeting Name", "Start Time", "End Time", "Recurrence", "Anchor Date", "Status", "MeetingKey")
+    RunAllStages srcWb
 
     srcWb.Close SaveChanges:=False
 
     Application.EnableEvents = prevEvents
     Application.ScreenUpdating = prevScreen
     Application.DisplayAlerts = prevAlerts
-    MigrateFromV2Test = "OK: " & gMigrationLog
+    MigrateFromV2Test = IIf(gMigrationHadError, "STAGE ERRORS: ", "OK: ") & gMigrationLog
     Exit Function
 ErrHandler:
     Application.EnableEvents = prevEvents
@@ -84,7 +78,13 @@ ErrHandler:
     MigrateFromV2Test = "ERROR " & Err.Number & ": " & Err.Description & " | Progress so far: " & gMigrationLog
 End Function
 
+' Old entry-point name, kept so the Alt+F8 instructions the user already
+' has still work.
 Public Sub MigrateFromV2()
+    MigrateFromPrevious
+End Sub
+
+Public Sub MigrateFromPrevious()
     On Error GoTo ErrHandler
 
     Dim prevEvents As Boolean, prevScreen As Boolean, prevAlerts As Boolean
@@ -113,16 +113,7 @@ Public Sub MigrateFromV2()
     Dim srcWb As Workbook
     Set srcWb = Workbooks.Open(CStr(srcPath), ReadOnly:=True, UpdateLinks:=0)
 
-    MigrateTasksAndArchive srcWb
-    MigrateCampaignsAndArchive srcWb
-    MigrateRecurringTasks srcWb
-    MigrateFlatTable srcWb, "Login Information", "LoginInformationTable", _
-        Array("Platform", "Website", "Username / Email", "Password", "Last Password Change", "Access", "Notes")
-    MigrateFlatTable srcWb, "Quick Links", "QuickLinksTable", _
-        Array("Category / Group", "Link / URL", "Description", "Notes")
-    MigrateFlatTable srcWb, "Schedule Data", "WorkLocationTable", Array("Date", "Location")
-    MigrateFlatTable srcWb, "Schedule Data", "MeetingsTable", _
-        Array("Meeting Name", "Start Time", "End Time", "Recurrence", "Anchor Date", "Status", "MeetingKey")
+    RunAllStages srcWb
 
     srcWb.Close SaveChanges:=False
 
@@ -130,6 +121,13 @@ Public Sub MigrateFromV2()
     Application.ScreenUpdating = prevScreen
     Application.DisplayAlerts = prevAlerts
 
+    If gMigrationHadError Then
+        MsgBox "Migration finished, but some parts hit an error (marked !! below). Everything else was copied." & _
+            vbCrLf & vbCrLf & gMigrationLog & vbCrLf & _
+            "Please send the !! line(s) -- they contain only the step, a row number and the error text, no data.", _
+            vbExclamation, "Migration finished with errors"
+        Exit Sub
+    End If
     MsgBox "Migration finished." & vbCrLf & vbCrLf & gMigrationLog & vbCrLf & _
         "Review every sheet before you trust it -- then save this file yourself when you're happy.", _
         vbInformation, "Migration finished"
@@ -175,6 +173,100 @@ Private Function NextTableRow(tbl As ListObject) As ListRow
     Set NextTableRow = tbl.ListRows.Add
 End Function
 
+' Destination column for a label, allowing for headers renamed since the
+' old file was built (V4, PLAN.md §22.9).
+Private Function FindDestColumn(ws As Worksheet, label As String) As Long
+    FindDestColumn = FindColumnByHeaderText(ws, 1, label)
+    If FindDestColumn = 0 And label = "Days Left" Then FindDestColumn = FindColumnByHeaderText(ws, 1, "Early / Late")
+End Function
+
+' Columns that only exist from V4 on -- an older source file can't have
+' them, so their absence isn't worth a "missing" warning.
+Private Function IsNewInV4(label As String) As Boolean
+    Select Case label
+        Case "Time", "If Missed", "RecurringSourceKey", "DoneSubtasks"
+            IsNewInV4 = True
+    End Select
+End Function
+
+Private Sub LogStageError(stage As String)
+    gMigrationHadError = True
+    gMigrationLog = gMigrationLog & "!! " & stage & " STOPPED"
+    If gMigrationRow > 0 Then gMigrationLog = gMigrationLog & " at old-file row " & gMigrationRow
+    gMigrationLog = gMigrationLog & ": error " & Err.Number & " -- " & Err.Description & vbCrLf
+End Sub
+
+' Every stage runs under its own error trap (V4, PLAN.md §22.9): one
+' failing stage is reported -- with the stage, the old file's row and the
+' exact error -- and the rest still run, instead of the whole migration
+' stopping with a bare error number. Archive and Campaigns Archive are
+' protected sheets, and Excel refuses Table operations (ListRows.Add) on a
+' protected sheet even with UserInterfaceOnly -- PLAN.md §7.1. Before V4
+' the migration never unprotected them, so the SECOND archived row (the
+' first reuses the table's blank starter row) always failed with 1004
+' "table functions aren't available because the sheet is protected" --
+' the root cause of §21's open "MigrateFromV2 errored on the real file"
+' bug, reproduced against a realistic V3 fixture.
+Private Sub RunAllStages(srcWb As Workbook)
+    Dim aws As Worksheet, caws As Worksheet
+    Set aws = ThisWorkbook.Sheets("Archive")
+    Set caws = ThisWorkbook.Sheets("Campaigns Archive")
+    gMigrationHadError = False
+
+    On Error Resume Next
+    aws.Unprotect
+    caws.Unprotect
+
+    gMigrationRow = 0: Err.Clear
+    MigrateTasksAndArchive srcWb
+    If Err.Number <> 0 Then LogStageError "Tasks"
+    gMigrationRow = 0: Err.Clear
+    MigrateArchive srcWb
+    If Err.Number <> 0 Then LogStageError "Archive"
+    ' Subtask progress for migrated tasks, rebuilt from the migrated
+    ' Archive (§22.11) -- needs both Tasks and Archive in place first.
+    gMigrationRow = 0: Err.Clear
+    Dim seeded As Long
+    seeded = modTasks.SeedDoneSubtaskCounters()
+    If Err.Number <> 0 Then
+        LogStageError "Subtask progress"
+    ElseIf seeded > 0 Then
+        gMigrationLog = gMigrationLog & "Subtask progress: rebuilt from Archive for " & seeded & " task(s)." & vbCrLf
+    End If
+    gMigrationRow = 0: Err.Clear
+    MigrateCampaignsAndArchive srcWb
+    If Err.Number <> 0 Then LogStageError "Campaigns"
+    gMigrationRow = 0: Err.Clear
+    MigrateCampaignsArchive srcWb
+    If Err.Number <> 0 Then LogStageError "Campaigns Archive"
+    gMigrationRow = 0: Err.Clear
+    MigrateRecurringTasks srcWb
+    If Err.Number <> 0 Then LogStageError "Recurring Tasks"
+    gMigrationRow = 0: Err.Clear
+    MigrateFlatTable srcWb, "Login Information", "LoginInformationTable", _
+        Array("Platform", "Website", "Username / Email", "Password", "Last Password Change", "Access", "Notes")
+    If Err.Number <> 0 Then LogStageError "Login Information"
+    gMigrationRow = 0: Err.Clear
+    MigrateFlatTable srcWb, "Quick Links", "QuickLinksTable", _
+        Array("Category / Group", "Link / URL", "Description", "Notes")
+    If Err.Number <> 0 Then LogStageError "Quick Links"
+    gMigrationRow = 0: Err.Clear
+    MigrateFlatTable srcWb, "Schedule Data", "WorkLocationTable", Array("Date", "Location")
+    If Err.Number <> 0 Then LogStageError "Schedule Data (work location)"
+    gMigrationRow = 0: Err.Clear
+    MigrateFlatTable srcWb, "Schedule Data", "MeetingsTable", _
+        Array("Meeting Name", "Start Time", "End Time", "Recurrence", "Anchor Date", "Status", "MeetingKey")
+    If Err.Number <> 0 Then LogStageError "Schedule Data (meetings)"
+
+    Err.Clear
+    aws.Protect UserInterfaceOnly:=True
+    caws.Protect UserInterfaceOnly:=True
+    modSchedule.RenderScheduleBadges
+    modDailyLog.GoThisWeek
+    modToday.RenderTodayPanel
+    On Error GoTo 0
+End Sub
+
 Private Function TrySheet(wb As Workbook, sheetName As String) As Worksheet
     On Error Resume Next
     Set TrySheet = wb.Sheets(sheetName)
@@ -208,12 +300,12 @@ Public Sub MigrateTasksAndArchive(srcWb As Workbook)
 
     Dim srcRowCount As Long, r As Long
     For r = 2 To srcLastRow
+        gMigrationRow = r
         If Len(Trim$(srcWs.Cells(r, keyCol).Value & "")) > 0 Then srcRowCount = srcRowCount + 1
     Next r
 
     If srcRowCount = 0 Then
         gMigrationLog = gMigrationLog & "Tasks: nothing to migrate (0 real rows found)." & vbCrLf
-        MigrateArchive srcWb
         Exit Sub
     End If
 
@@ -232,7 +324,7 @@ Public Sub MigrateTasksAndArchive(srcWb As Workbook)
     Dim labels() As Variant
     labels = Array("Start Date", "Task", "Project / Category", "Priority", "Deadline", "Status", _
                     "Time Spent (hrs)", "Notes", "TaskKey", "ParentKey", "SiblingOrder", _
-                    "LinkedCampaignKey", "TimerRunningSince")
+                    "LinkedCampaignKey", "TimerRunningSince", "RecurringSourceKey", "DoneSubtasks")
 
     Dim n As Long
     n = UBound(labels) - LBound(labels) + 1
@@ -242,13 +334,14 @@ Public Sub MigrateTasksAndArchive(srcWb As Workbook)
     Dim i As Long, missing As String
     For i = 1 To n
         srcCols(i) = FindColumnByHeaderText(srcWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        destCols(i) = FindColumnByHeaderText(destWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        If srcCols(i) = 0 Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
+        destCols(i) = FindDestColumn(destWs, CStr(labels(LBound(labels) + i - 1)))
+        If srcCols(i) = 0 And Not IsNewInV4(CStr(labels(LBound(labels) + i - 1))) Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
     Next i
 
     Dim destRow As Long
     destRow = 2
     For r = 2 To srcLastRow
+        gMigrationRow = r
         If Len(Trim$(srcWs.Cells(r, keyCol).Value & "")) > 0 Then
             For i = 1 To n
                 If srcCols(i) > 0 And destCols(i) > 0 Then
@@ -266,8 +359,6 @@ Public Sub MigrateTasksAndArchive(srcWb As Workbook)
     gMigrationLog = gMigrationLog & "Tasks: migrated " & srcRowCount & " row(s)."
     If Len(missing) > 0 Then gMigrationLog = gMigrationLog & " (old file was missing: " & Left$(missing, Len(missing) - 2) & ")"
     gMigrationLog = gMigrationLog & vbCrLf
-
-    MigrateArchive srcWb
 End Sub
 
 Public Sub MigrateArchive(srcWb As Workbook)
@@ -306,12 +397,13 @@ Public Sub MigrateArchive(srcWb As Workbook)
     Dim i As Long, missing As String
     For i = 1 To n
         srcCols(i) = FindColumnByHeaderText(srcWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        destCols(i) = FindColumnByHeaderText(destWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        If srcCols(i) = 0 Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
+        destCols(i) = FindDestColumn(destWs, CStr(labels(LBound(labels) + i - 1)))
+        If srcCols(i) = 0 And Not IsNewInV4(CStr(labels(LBound(labels) + i - 1))) Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
     Next i
 
     Dim r As Long, migrated As Long
     For r = 2 To srcLastRow
+        gMigrationRow = r
         If Len(Trim$(srcWs.Cells(r, anchorCol).Value & "")) > 0 Then
             Dim destRow As ListRow
             Set destRow = NextTableRow(destTbl)
@@ -320,6 +412,7 @@ Public Sub MigrateArchive(srcWb As Workbook)
                     destWs.Cells(destRow.Range.Row, destCols(i)).Value = srcWs.Cells(r, srcCols(i)).Value
                 End If
             Next i
+            modTasks.FinishArchiveRow destWs, destRow.Range.Row
             migrated = migrated + 1
         End If
     Next r
@@ -398,7 +491,6 @@ Public Sub MigrateCampaignsAndArchive(srcWb As Workbook)
     If overflow > 0 Then gMigrationLog = gMigrationLog & " WARNING: " & overflow & " more campaign(s) in the old file didn't fit in the 20 slots and were NOT migrated."
     gMigrationLog = gMigrationLog & vbCrLf
 
-    MigrateCampaignsArchive srcWb
 End Sub
 
 Public Sub MigrateCampaignsArchive(srcWb As Workbook)
@@ -435,12 +527,13 @@ Public Sub MigrateCampaignsArchive(srcWb As Workbook)
     Dim i As Long, missing As String
     For i = 1 To n
         srcCols(i) = FindColumnByHeaderText(srcWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        destCols(i) = FindColumnByHeaderText(destWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        If srcCols(i) = 0 Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
+        destCols(i) = FindDestColumn(destWs, CStr(labels(LBound(labels) + i - 1)))
+        If srcCols(i) = 0 And Not IsNewInV4(CStr(labels(LBound(labels) + i - 1))) Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
     Next i
 
     Dim r As Long, migrated As Long
     For r = 2 To srcLastRow
+        gMigrationRow = r
         If Len(Trim$(srcWs.Cells(r, anchorCol).Value & "")) > 0 Then
             Dim destRow As ListRow
             Set destRow = NextTableRow(destTbl)
@@ -480,6 +573,7 @@ Public Sub MigrateRecurringTasks(srcWb As Workbook)
 
     Dim srcRowCount As Long, r As Long
     For r = 2 To srcLastRow
+        gMigrationRow = r
         If Len(Trim$(srcWs.Cells(r, keyCol).Value & "")) > 0 Then srcRowCount = srcRowCount + 1
     Next r
 
@@ -504,7 +598,7 @@ Public Sub MigrateRecurringTasks(srcWb As Workbook)
 
     Dim labels() As Variant
     labels = Array("Status", "Task", "Project / Category", "Linked Campaign", "Priority", "Recurrence", _
-                    "Task Start On", "Deadline Offset (days)", "Notes", "RecurringKey", "RecurringParentKey", _
+                    "Task Start On", "Time", "If Missed", "Deadline Offset (days)", "Notes", "RecurringKey", "RecurringParentKey", _
                     "SiblingOrder", "LinkedCampaignKey", "Last Generated")
 
     Dim n As Long
@@ -515,13 +609,14 @@ Public Sub MigrateRecurringTasks(srcWb As Workbook)
     Dim i As Long, missing As String
     For i = 1 To n
         srcCols(i) = FindColumnByHeaderText(srcWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        destCols(i) = FindColumnByHeaderText(destWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        If srcCols(i) = 0 Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
+        destCols(i) = FindDestColumn(destWs, CStr(labels(LBound(labels) + i - 1)))
+        If srcCols(i) = 0 And Not IsNewInV4(CStr(labels(LBound(labels) + i - 1))) Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
     Next i
 
     Dim destRow As Long, copied As Long
     destRow = 2
     For r = 2 To srcLastRow
+        gMigrationRow = r
         If Len(Trim$(srcWs.Cells(r, keyCol).Value & "")) > 0 Then
             If copied < toMigrate Then
                 For i = 1 To n
@@ -535,26 +630,31 @@ Public Sub MigrateRecurringTasks(srcWb As Workbook)
         End If
     Next r
 
-    ' Recurring Tasks' own column map, mirroring modRecurringTasks.bas's
-    ' (Private there, so rebuilt here rather than exposed just for this).
-    Dim rtMap As modHierarchy.HierarchyColumnMap
-    rtMap.FirstDataRow = 2
-    rtMap.LastCol = 20
-    rtMap.ColID = 2
-    rtMap.ColTask = 5
-    rtMap.ColNumSubtasks = 6
-    rtMap.ColDaysLeft = 0
-    rtMap.ColSubtaskOf = 7
-    rtMap.ColKey = 15
-    rtMap.ColParentKey = 16
-    rtMap.ColLevel = 17
-    rtMap.ColSiblingOrder = 18
-
-    modHierarchy.RenumberHierarchy destWs, rtMap
+    ' Recurring Tasks' real column map (Public since V4 -- this module
+    ' used to keep its own hard-coded copy, which went stale the moment
+    ' Time/If Missed were inserted, PLAN.md §22.9).
+    modHierarchy.RenumberHierarchy destWs, modRecurringTasks.RTColMap()
     modRecurringTasks.RefreshButtonStyling destWs
     modRecurringTasks.RefreshLinkedCampaignLabels destWs
 
+    ' V4 (PLAN.md §22.3): a subtask's own Recurrence used to be ignored;
+    ' now it decides which days that subtask is generated on. Say so, so
+    ' an old leftover value doesn't silently start filtering.
+    Dim ownSchedule As Long, rr As Long
+    Dim rtMap As modHierarchy.HierarchyColumnMap
+    rtMap = modRecurringTasks.RTColMap()
+    Dim recCol As Long
+    recCol = FindColumnByHeaderText(destWs, 1, "Recurrence")
+    For rr = 2 To destRow - 1
+        If Len(Trim$(destWs.Cells(rr, rtMap.ColParentKey).Value & "")) > 0 And recCol > 0 Then
+            If Len(Trim$(destWs.Cells(rr, recCol).Value & "")) > 0 Then ownSchedule = ownSchedule + 1
+        End If
+    Next rr
+
     gMigrationLog = gMigrationLog & "Recurring Tasks: migrated " & copied & " row(s)."
+    If ownSchedule > 0 Then gMigrationLog = gMigrationLog & " NOTE: " & ownSchedule & _
+        " subtask(s) have their own Recurrence -- since V4 that decides which days they're generated on " & _
+        "(blank = same as parent). Check them on the Recurring Tasks sheet."
     If overflow > 0 Then gMigrationLog = gMigrationLog & " WARNING: " & overflow & " more row(s) didn't fit in the 100-row allowance and were NOT migrated."
     If Len(missing) > 0 Then gMigrationLog = gMigrationLog & " (old file was missing: " & Left$(missing, Len(missing) - 2) & ")"
     gMigrationLog = gMigrationLog & vbCrLf
@@ -599,12 +699,13 @@ Public Sub MigrateFlatTable(srcWb As Workbook, sheetName As String, tableName As
     Dim i As Long, missing As String
     For i = 1 To n
         srcCols(i) = FindColumnByHeaderText(srcWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        destCols(i) = FindColumnByHeaderText(destWs, 1, CStr(labels(LBound(labels) + i - 1)))
-        If srcCols(i) = 0 Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
+        destCols(i) = FindDestColumn(destWs, CStr(labels(LBound(labels) + i - 1)))
+        If srcCols(i) = 0 And Not IsNewInV4(CStr(labels(LBound(labels) + i - 1))) Then missing = missing & CStr(labels(LBound(labels) + i - 1)) & ", "
     Next i
 
     Dim r As Long, migrated As Long
     For r = 2 To srcLastRow
+        gMigrationRow = r
         If Len(Trim$(srcWs.Cells(r, anchorCol).Value & "")) > 0 Then
             Dim destRow As ListRow
             Set destRow = NextTableRow(destTbl)

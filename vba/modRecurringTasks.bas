@@ -32,15 +32,17 @@ Private Const RT_COL_LINKED_CAMPAIGN As Long = 9
 Private Const RT_COL_PRIORITY As Long = 10
 Private Const RT_COL_RECURRENCE As Long = 11
 Private Const RT_COL_TASK_START_ON As Long = 12
-Private Const RT_COL_DEADLINE_OFFSET As Long = 13
-Private Const RT_COL_NOTES As Long = 14
-Private Const RT_COL_KEY As Long = 15             ' RecurringKey
-Private Const RT_COL_PARENT_KEY As Long = 16       ' RecurringParentKey
-Private Const RT_COL_LEVEL As Long = 17
-Private Const RT_COL_SIBLING_ORDER As Long = 18
-Private Const RT_COL_LINKED_CAMPAIGN_KEY As Long = 19
-Private Const RT_COL_LAST_GENERATED As Long = 20   ' LastGeneratedThroughDate, root rows only
-Private Const RT_LAST_COL As Long = 20
+Private Const RT_COL_TIME As Long = 13            ' V4, PLAN.md §22.3
+Private Const RT_COL_IF_MISSED As Long = 14       ' V4, PLAN.md §22.4 (root rows only)
+Private Const RT_COL_DEADLINE_OFFSET As Long = 15
+Private Const RT_COL_NOTES As Long = 16
+Private Const RT_COL_KEY As Long = 17             ' RecurringKey
+Private Const RT_COL_PARENT_KEY As Long = 18       ' RecurringParentKey
+Private Const RT_COL_LEVEL As Long = 19
+Private Const RT_COL_SIBLING_ORDER As Long = 20
+Private Const RT_COL_LINKED_CAMPAIGN_KEY As Long = 21
+Private Const RT_COL_LAST_GENERATED As Long = 22   ' LastGeneratedThroughDate, root rows only
+Private Const RT_LAST_COL As Long = 22
 
 Private Const RT_FIRST_DATA_ROW As Long = 2
 
@@ -57,29 +59,43 @@ Private Const CAMPAIGNS_ARCHIVE_COL_KEY As Long = 8
 
 ' --- Tasks' own column layout (destination of generated instances --
 ' mirrors modTasks.bas's own Private constants; see above for why this
-' isn't shared directly) ---
+' isn't shared directly). Only the columns that sit at the SAME position
+' in both the employee and manager Tasks layouts stay here -- by
+' construction (tasks.py's own docstring: manager's PIC + Completed
+' Subtasks insertions exactly offset Timer + Time Spent's removal, so
+' both variants' hidden block starts at the same column Q), that's Up/
+' Down/Start Date/Task/Notes and the whole hidden hierarchy block
+' (TaskKey/ParentKey/Level/SiblingOrder). Project/Linked Campaign/Linked
+' Campaign Key/Priority/Deadline/Status genuinely differ between variants
+' (and Timer/Time Spent don't exist for manager at all), so writing those
+' -- plus generating the new TaskKey itself and the post-loop
+' RenumberHierarchy/RefreshButtonStyling calls, which need the right
+' variant's own TasksColMap -- is delegated to modRecurringTasksWriter, a
+' logical module name injected from a different source file per variant
+' (modRecurringTasksWriter.bas / modRecurringTasksWriterManager.bas, see
+' inject_vba.py) specifically so this file can reference it by a single
+' qualified name that resolves for both builds, while modTasks/
+' modTasksManager themselves (which only one variant ever has) are never
+' referenced here at all -- avoiding the compile error a variant-specific
+' cross-module reference would otherwise cause in the OTHER build (the
+' same class of problem ThisWorkbook.bas's Timer check has, plan §8).
 Private Const TASKS_COL_UP As Long = 2
 Private Const TASKS_COL_DOWN As Long = 3
 Private Const TASKS_COL_START_DATE As Long = 4
 Private Const TASKS_COL_TASK As Long = 5
-Private Const TASKS_COL_PROJECT As Long = 8
-Private Const TASKS_COL_LINKED_CAMPAIGN As Long = 9
-Private Const TASKS_COL_PRIORITY As Long = 10
-Private Const TASKS_COL_DEADLINE As Long = 11
-Private Const TASKS_COL_STATUS As Long = 12
-Private Const TASKS_COL_TIMER As Long = 14
-Private Const TASKS_COL_TIME_SPENT As Long = 15
 Private Const TASKS_COL_NOTES As Long = 16
 Private Const TASKS_COL_TASK_KEY As Long = 17
 Private Const TASKS_COL_PARENT_KEY As Long = 18
 Private Const TASKS_COL_LEVEL As Long = 19
 Private Const TASKS_COL_SIBLING_ORDER As Long = 20
-Private Const TASKS_COL_LINKED_CAMPAIGN_KEY As Long = 22
 Private Const TASKS_FIRST_DATA_ROW As Long = 2
 
 Private Const MAX_OCCURRENCES_PER_RUN As Long = 30   ' tunable, PLAN.md §5/§12.1
 
-Private Function RTColMap() As HierarchyColumnMap
+' Public so modMigration can reuse the one real column map instead of
+' keeping its own hard-coded copy (which silently went stale the moment
+' V4 inserted Time/If Missed, PLAN.md §22.9).
+Public Function RTColMap() As HierarchyColumnMap
     Dim m As HierarchyColumnMap
     m.FirstDataRow = RT_FIRST_DATA_ROW
     m.LastCol = RT_LAST_COL
@@ -199,6 +215,8 @@ Public Sub RefreshButtonStyling(ws As Worksheet)
         If Len(Trim$(ws.Cells(r, RT_COL_KEY).Value & "")) > 0 Then
             modDesignSystem.ApplyButtonLook ws.Cells(r, RT_COL_UP)
             modDesignSystem.ApplyButtonLook ws.Cells(r, RT_COL_DOWN)
+            modDesignSystem.HideNumberAsTextFlag ws.Cells(r, RT_COL_ID)
+            modDesignSystem.HideNumberAsTextFlag ws.Cells(r, RT_COL_SUBTASK_OF)
         End If
     Next r
 End Sub
@@ -641,6 +659,27 @@ Public Function ProcessTemplate(ws As Worksheet, tasksWs As Worksheet, templateR
     Dim allDates() As Date, dateCount As Long
     ComputeScheduledDates recurrence, taskStartOn, fromDate, Date, allDates, dateCount
 
+    ' "If Missed = Skip" (V4, PLAN.md §22.4): first archive any of this
+    ' template's still-open instances whose deadline day has passed, then
+    ' only generate occurrences whose deadline day is today or later -- an
+    ' instance that would be skipped the moment it appeared is never
+    ' created at all.
+    If Trim$(ws.Cells(templateRootRow, RT_COL_IF_MISSED).Value & "") = "Skip" Then
+        modRecurringTasksWriter.SkipMissedInstances CDbl(ws.Cells(templateRootRow, RT_COL_KEY).Value)
+
+        Dim rootOffset As Double
+        rootOffset = Val(ws.Cells(templateRootRow, RT_COL_DEADLINE_OFFSET).Value & "")
+        Dim kept As Long, q As Long
+        kept = 0
+        For q = 1 To dateCount
+            If allDates(q) + rootOffset >= Date Then
+                kept = kept + 1
+                allDates(kept) = allDates(q)
+            End If
+        Next q
+        dateCount = kept
+    End If
+
     Dim skipped As Long
     Dim genCount As Long
     skipped = 0
@@ -660,13 +699,14 @@ Public Function ProcessTemplate(ws As Worksheet, tasksWs As Worksheet, templateR
     Next i
 
     If genCount > 0 Then
-        RenumberHierarchy tasksWs, modTasks.TasksColMap()
-        ' GenerateInstance() writes Tasks' Up/Down/Timer cells directly,
-        ' bypassing HandleTaskNameChange entirely (see its own comment
-        ' below) -- so the button-look those generated rows need has to
-        ' be applied here explicitly too, not just at modTasks.bas's own
-        ' RenumberHierarchy call sites.
-        modTasks.RefreshButtonStyling tasksWs
+        ' modRecurringTasksWriter.FinalizeGeneration does the variant's own
+        ' RenumberHierarchy + RefreshButtonStyling -- GenerateInstance()
+        ' writes Tasks' Up/Down (and, employee only, Timer) cells directly,
+        ' bypassing HandleTaskNameChange entirely, so the button-look those
+        ' generated rows need has to be applied here explicitly too, not
+        ' just at modTasks.bas's/modTasksManager.bas's own RenumberHierarchy
+        ' call sites.
+        modRecurringTasksWriter.FinalizeGeneration tasksWs
     End If
 
     ws.Cells(templateRootRow, RT_COL_LAST_GENERATED).Value = Date
@@ -674,13 +714,26 @@ Public Function ProcessTemplate(ws As Worksheet, tasksWs As Worksheet, templateR
     ProcessTemplate = skipped
 End Function
 
-' Deep-copies templateRootRow's entire branch (root + all descendants) as
-' one new instance in Tasks, dated occurrenceDate. Relies on Recurring
-' Tasks' own tree already being in physical depth-first order (guaranteed
-' by RenumberHierarchy's own invariant -- see modHierarchy.bas), so a
-' plain top-to-bottom scan of the branch visits each parent before its
-' children, letting the RecurringKey -> new-TaskKey map be built in a
-' single forward pass.
+' Deep-copies one occurrence of templateRootRow's branch into Tasks, dated
+' occurrenceDate. Relies on Recurring Tasks' own tree already being in
+' physical depth-first order (guaranteed by RenumberHierarchy's own
+' invariant -- see modHierarchy.bas), so a plain top-to-bottom scan of the
+' branch visits each parent before its children.
+'
+' V4 (PLAN.md §22.3) -- three changes from the original "copy the whole
+' branch verbatim" behavior:
+'   1. Per-row schedules: a subtask is only copied if its own Status is
+'      Active, its parent was copied, and its own Recurrence is blank
+'      ("same as parent") or matches occurrenceDate. The root's schedule
+'      gates everything below it.
+'   2. Time: Deadline's time of day comes from the row's Time column
+'      (else the old fixed 18:00), and each copied parent's children are
+'      ordered by Time (untimed last, ties keep template order).
+'   3. Placement (user-reported): the generated root used to inherit the
+'      TEMPLATE's own SiblingOrder, colliding with the user's existing
+'      top-level tasks (generated "1" sorted beside/above real task "1").
+'      It now takes the next free root SiblingOrder in Tasks, so a new
+'      instance always lands below everything already there.
 Private Sub GenerateInstance(ws As Worksheet, tasksWs As Worksheet, templateRootRow As Long, occurrenceDate As Date)
     Dim idText As String
     idText = Trim$(ws.Cells(templateRootRow, RT_COL_ID).Value & "")
@@ -707,6 +760,71 @@ Private Sub GenerateInstance(ws As Worksheet, tasksWs As Worksheet, templateRoot
         End If
     Next i
 
+    ' --- Pass 1: which rows belong to this occurrence ---
+    Dim included() As Boolean
+    ReDim included(1 To n)
+    Dim includedByKey As Object
+    Set includedByKey = CreateObject("Scripting.Dictionary")
+
+    Dim k As Long
+    For k = 1 To n
+        Dim srcRow As Long
+        srcRow = branchRows(k)
+        If k = 1 Then
+            included(k) = True
+        Else
+            Dim parentKeyText As String
+            parentKeyText = Trim$(ws.Cells(srcRow, RT_COL_PARENT_KEY).Value & "")
+            included(k) = False
+            If includedByKey.Exists(parentKeyText) Then
+                If includedByKey(parentKeyText) Then
+                    If Trim$(ws.Cells(srcRow, RT_COL_STATUS).Value & "") = "Active" Then
+                        included(k) = RowScheduleMatches(ws, srcRow, occurrenceDate)
+                    End If
+                End If
+            End If
+        End If
+        includedByKey(Trim$(ws.Cells(srcRow, RT_COL_KEY).Value & "")) = included(k)
+    Next k
+
+    ' --- Pass 2: time of day + per-parent ordering by time ---
+    Dim timeOfDay() As Double
+    Dim sortKey() As Double
+    ReDim timeOfDay(1 To n)
+    ReDim sortKey(1 To n)
+    For k = 1 To n
+        timeOfDay(k) = TimeOfDayOrNegative(ws.Cells(branchRows(k), RT_COL_TIME).Value)
+        Dim minutesKey As Double
+        If timeOfDay(k) >= 0 Then
+            minutesKey = Round(timeOfDay(k) * 1440, 0)
+        Else
+            minutesKey = 2000   ' untimed sorts after every real time (max 1439)
+        End If
+        sortKey(k) = minutesKey * 100000# + Val(ws.Cells(branchRows(k), RT_COL_SIBLING_ORDER).Value & "")
+    Next k
+
+    Dim newSiblingOrder() As Double
+    ReDim newSiblingOrder(1 To n)
+    Dim j As Long
+    For k = 2 To n
+        If included(k) Then
+            Dim myParent As String
+            myParent = Trim$(ws.Cells(branchRows(k), RT_COL_PARENT_KEY).Value & "")
+            Dim rank As Long
+            rank = 1
+            For j = 2 To n
+                If j <> k And included(j) Then
+                    If Trim$(ws.Cells(branchRows(j), RT_COL_PARENT_KEY).Value & "") = myParent Then
+                        If sortKey(j) < sortKey(k) Or (sortKey(j) = sortKey(k) And j < k) Then rank = rank + 1
+                    End If
+                End If
+            Next j
+            newSiblingOrder(k) = rank * 10
+        End If
+    Next k
+    newSiblingOrder(1) = NextSiblingOrder(tasksWs, TasksKeyColMap(), "")
+
+    ' --- Pass 3: write the included rows into Tasks ---
     Dim keyMap As Object
     Set keyMap = CreateObject("Scripting.Dictionary")
 
@@ -719,89 +837,131 @@ Private Sub GenerateInstance(ws As Worksheet, tasksWs As Worksheet, templateRoot
         destRow = tasksLastRow + 1
     End If
 
-    Dim k As Long
     For k = 1 To n
-        Dim srcRow As Long
-        srcRow = branchRows(k)
+        If included(k) Then
+            srcRow = branchRows(k)
 
-        Dim newTaskKey As Double
-        newTaskKey = modTasks.NextTaskKey()
-        keyMap(CDbl(ws.Cells(srcRow, RT_COL_KEY).Value)) = newTaskKey
+            Dim newTaskKey As Double
+            newTaskKey = modRecurringTasksWriter.NextGeneratedTaskKey()
+            keyMap(Trim$(ws.Cells(srcRow, RT_COL_KEY).Value & "")) = newTaskKey
 
-        Dim newParentKeyText As String
-        Dim rawParent As String
-        rawParent = Trim$(ws.Cells(srcRow, RT_COL_PARENT_KEY).Value & "")
-        If Len(rawParent) = 0 Then
-            newParentKeyText = ""
-        Else
-            newParentKeyText = CStr(keyMap(CDbl(rawParent)))
+            Dim newParentKeyText As String
+            Dim rawParent As String
+            rawParent = Trim$(ws.Cells(srcRow, RT_COL_PARENT_KEY).Value & "")
+            If k = 1 Or Len(rawParent) = 0 Then
+                newParentKeyText = ""
+            Else
+                newParentKeyText = CStr(keyMap(rawParent))
+            End If
+
+            tasksWs.Cells(destRow, TASKS_COL_TASK).Value = ws.Cells(srcRow, RT_COL_TASK).Value
+
+            ' "None", not whatever the template's own Linked Campaign happens
+            ' to hold, if that's blank (defensive -- HandleTaskNameChange
+            ' already defaults a template's own Linked Campaign to "None" on
+            ' creation, so this should rarely actually trigger).
+            Dim linkedCampaignVal As String
+            linkedCampaignVal = Trim$(ws.Cells(srcRow, RT_COL_LINKED_CAMPAIGN).Value & "")
+            If Len(linkedCampaignVal) = 0 Then linkedCampaignVal = "None"
+
+            ' Now(), not occurrenceDate (user-reported, PLAN.md §19 Phase 5):
+            ' Start Date's meaning everywhere else in this workbook is "when
+            ' was this row created" -- occurrenceDate is still what Deadline
+            ' below is based on, so a backfilled batch keeps distinct days.
+            tasksWs.Cells(destRow, TASKS_COL_START_DATE).Value = Now()
+
+            Dim offsetDays As Double
+            offsetDays = 0
+            If Len(Trim$(ws.Cells(srcRow, RT_COL_DEADLINE_OFFSET).Value & "")) > 0 Then
+                offsetDays = CDbl(ws.Cells(srcRow, RT_COL_DEADLINE_OFFSET).Value)
+            End If
+            ' The row's own Time if set (§22.3), else 18:00 as the default
+            ' end-of-workday cutoff (PLAN.md §19 Phase 5).
+            Dim deadlineVal As Date
+            If timeOfDay(k) >= 0 Then
+                deadlineVal = occurrenceDate + offsetDays + timeOfDay(k)
+            Else
+                deadlineVal = occurrenceDate + offsetDays + TimeSerial(18, 0, 0)
+            End If
+
+            ' Project/Linked Campaign/Linked Campaign Key/Priority/Deadline/
+            ' Status genuinely differ in column position between variants (and
+            ' Timer/Time Spent don't exist for manager) -- delegated to
+            ' modRecurringTasksWriter, see this module's own column-layout
+            ' comment above for why.
+            modRecurringTasksWriter.WriteVariantSpecificFields tasksWs, destRow, _
+                ws.Cells(srcRow, RT_COL_PROJECT).Value, linkedCampaignVal, _
+                ws.Cells(srcRow, RT_COL_LINKED_CAMPAIGN_KEY).Value, ws.Cells(srcRow, RT_COL_PRIORITY).Value, deadlineVal
+
+            tasksWs.Cells(destRow, TASKS_COL_NOTES).Value = ws.Cells(srcRow, RT_COL_NOTES).Value
+
+            ' Up/Down defaults (user-reported, PLAN.md §19 Phase 5): this
+            ' writes a Tasks row directly, bypassing HandleTaskNameChange, so
+            ' its "new task" defaults are applied here explicitly. Timer's
+            ' own default (employee only) is written by
+            ' WriteVariantSpecificFields above instead.
+            tasksWs.Cells(destRow, TASKS_COL_UP).Value = ICON_UP
+            tasksWs.Cells(destRow, TASKS_COL_DOWN).Value = ICON_DOWN
+
+            tasksWs.Cells(destRow, TASKS_COL_TASK_KEY).Value = newTaskKey
+            tasksWs.Cells(destRow, TASKS_COL_PARENT_KEY).Value = newParentKeyText
+            tasksWs.Cells(destRow, TASKS_COL_LEVEL).Value = ws.Cells(srcRow, RT_COL_LEVEL).Value
+            tasksWs.Cells(destRow, TASKS_COL_SIBLING_ORDER).Value = newSiblingOrder(k)
+            If k = 1 Then
+                modRecurringTasksWriter.WriteRecurringSource tasksWs, destRow, CDbl(ws.Cells(srcRow, RT_COL_KEY).Value)
+            End If
+
+            destRow = destRow + 1
         End If
-
-        tasksWs.Cells(destRow, TASKS_COL_TASK).Value = ws.Cells(srcRow, RT_COL_TASK).Value
-        tasksWs.Cells(destRow, TASKS_COL_PROJECT).Value = ws.Cells(srcRow, RT_COL_PROJECT).Value
-
-        ' "None", not whatever the template's own Linked Campaign happens
-        ' to hold, if that's blank (defensive -- HandleTaskNameChange
-        ' already defaults a template's own Linked Campaign to "None" on
-        ' creation, so this should rarely actually trigger).
-        Dim linkedCampaignVal As String
-        linkedCampaignVal = Trim$(ws.Cells(srcRow, RT_COL_LINKED_CAMPAIGN).Value & "")
-        If Len(linkedCampaignVal) = 0 Then linkedCampaignVal = "None"
-        tasksWs.Cells(destRow, TASKS_COL_LINKED_CAMPAIGN).Value = linkedCampaignVal
-        tasksWs.Cells(destRow, TASKS_COL_LINKED_CAMPAIGN_KEY).Value = ws.Cells(srcRow, RT_COL_LINKED_CAMPAIGN_KEY).Value
-        tasksWs.Cells(destRow, TASKS_COL_PRIORITY).Value = ws.Cells(srcRow, RT_COL_PRIORITY).Value
-        ' Now(), not occurrenceDate (user-reported, PLAN.md §19 Phase 5):
-        ' occurrenceDate has no time component (a plain Date from
-        ' ComputeScheduledDates' loop), so Start Date always showed
-        ' midnight instead of the actual moment this instance was
-        ' generated -- inconsistent with every manually-created task,
-        ' whose Start Date is Now() (modTasks.bas's HandleTaskNameChange).
-        ' occurrenceDate is intentionally still used for Deadline below --
-        ' that field needs to represent which CALENDAR DAY this instance
-        ' is actually for (so a backfilled batch's occurrences keep
-        ' distinct deadlines), whereas Start Date's meaning everywhere
-        ' else in this workbook is "when was this row created," not
-        ' "which day does it conceptually represent."
-        tasksWs.Cells(destRow, TASKS_COL_START_DATE).Value = Now()
-
-        Dim offsetDays As Double
-        offsetDays = 0
-        If Len(Trim$(ws.Cells(srcRow, RT_COL_DEADLINE_OFFSET).Value & "")) > 0 Then
-            offsetDays = CDbl(ws.Cells(srcRow, RT_COL_DEADLINE_OFFSET).Value)
-        End If
-        ' + TimeSerial(18,0,0), not just the bare date (user-requested,
-        ' PLAN.md §19 Phase 5): occurrenceDate has no time component, so
-        ' the Deadline always landed at midnight -- an unhelpfully early
-        ' cutoff for a task whose actual working day hasn't started yet.
-        ' 18:00 as a reasonable default end-of-workday time.
-        tasksWs.Cells(destRow, TASKS_COL_DEADLINE).Value = occurrenceDate + offsetDays + TimeSerial(18, 0, 0)
-
-        tasksWs.Cells(destRow, TASKS_COL_STATUS).Value = "Not Started"
-        tasksWs.Cells(destRow, TASKS_COL_NOTES).Value = ws.Cells(srcRow, RT_COL_NOTES).Value
-
-        ' Up/Down/Timer/Time Spent defaults (user-reported, PLAN.md §19
-        ' Phase 5): GenerateInstance writes a Tasks row directly, bypassing
-        ' modTasks.HandleTaskNameChange entirely, so it never picked up
-        ' any of the "new task" defaults added there over the course of
-        ' this phase -- a generated instance looked all-blank/undefaulted
-        ' until manually double-clicked, unlike a normally-typed task.
-        tasksWs.Cells(destRow, TASKS_COL_UP).Value = ICON_UP
-        tasksWs.Cells(destRow, TASKS_COL_DOWN).Value = ICON_DOWN
-        tasksWs.Cells(destRow, TASKS_COL_TIMER).Value = ICON_TIMER_RUNNING & " Start"
-        ' 0, not blank -- Time Spent (hrs) is hidden, but its value drives
-        ' the visible friendly "Time Spent" column's formula
-        ' (=IF(ts="","",...)), so a genuinely blank hrs cell showed as a
-        ' blank friendly cell instead of "0h 00m".
-        tasksWs.Cells(destRow, TASKS_COL_TIME_SPENT).Value = 0
-
-        tasksWs.Cells(destRow, TASKS_COL_TASK_KEY).Value = newTaskKey
-        tasksWs.Cells(destRow, TASKS_COL_PARENT_KEY).Value = newParentKeyText
-        tasksWs.Cells(destRow, TASKS_COL_LEVEL).Value = ws.Cells(srcRow, RT_COL_LEVEL).Value
-        tasksWs.Cells(destRow, TASKS_COL_SIBLING_ORDER).Value = ws.Cells(srcRow, RT_COL_SIBLING_ORDER).Value
-
-        destRow = destRow + 1
     Next k
 End Sub
+
+' Does row r's OWN Recurrence/Task Start On match date d? Blank
+' Recurrence means "same as parent" (PLAN.md §22.3) -- the caller has
+' already established the parent matched, so blank is a match.
+Private Function RowScheduleMatches(ws As Worksheet, r As Long, d As Date) As Boolean
+    Dim rec As String
+    rec = Trim$(ws.Cells(r, RT_COL_RECURRENCE).Value & "")
+    If Len(rec) = 0 Then
+        RowScheduleMatches = True
+        Exit Function
+    End If
+    Dim dates() As Date, cnt As Long
+    ComputeScheduledDates rec, Trim$(ws.Cells(r, RT_COL_TASK_START_ON).Value & ""), d, d, dates, cnt
+    RowScheduleMatches = (cnt > 0)
+End Function
+
+' A Time cell's time of day as a 0..1 day fraction, or -1 if blank/not a
+' time. Accepts a real time value (the normal case -- Excel parses a
+' typed "10:00") or a text "10:00" (a cell formatted as Text).
+Private Function TimeOfDayOrNegative(v As Variant) As Double
+    TimeOfDayOrNegative = -1
+    If IsEmpty(v) Then Exit Function
+    If Len(Trim$(v & "")) = 0 Then Exit Function
+    On Error GoTo NotATime
+    Dim x As Double
+    If IsNumeric(v) Then
+        x = CDbl(v)
+    Else
+        x = CDbl(CDate(v))
+    End If
+    TimeOfDayOrNegative = x - Int(x)
+    Exit Function
+NotATime:
+    TimeOfDayOrNegative = -1
+End Function
+
+' The slice of Tasks' column map NextSiblingOrder needs (key, parent key,
+' sibling order) -- those three sit at the same columns in both variants,
+' see the TASKS_COL_* comment above.
+Private Function TasksKeyColMap() As HierarchyColumnMap
+    Dim m As HierarchyColumnMap
+    m.FirstDataRow = TASKS_FIRST_DATA_ROW
+    m.ColKey = TASKS_COL_TASK_KEY
+    m.ColParentKey = TASKS_COL_PARENT_KEY
+    m.ColSiblingOrder = TASKS_COL_SIBLING_ORDER
+    TasksKeyColMap = m
+End Function
 
 ' Production entry point -- called from Workbook_Open (a later Phase 3
 ' item). Walks every Active, root-level (RecurringParentKey blank)

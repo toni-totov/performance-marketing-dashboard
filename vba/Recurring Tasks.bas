@@ -43,12 +43,12 @@ Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean
                 modRecurringTasks.HandleTaskCollapseDoubleClick Target.Row
                 Cancel = True
             End If
-        Case 14   ' Notes -- column 15 is the hidden RecurringKey (§20 bug
+        Case 16   ' Notes -- column 17 is the hidden RecurringKey (§20 bug
                    ' #2, same root cause as Tasks): a row with no key yet is
                    ' one RenumberHierarchy call away from being treated as a
                    ' blank/phantom row and having whatever's written here
                    ' silently discarded.
-            If Len(Trim$(Target.Worksheet.Cells(Target.Row, 15).Value & "")) = 0 Then
+            If Len(Trim$(Target.Worksheet.Cells(Target.Row, 17).Value & "")) = 0 Then
                 MsgBox "Type the task name first, then add notes.", vbInformation, "No task yet"
             Else
                 frmNotes.ShowForCell Target

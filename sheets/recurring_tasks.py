@@ -13,10 +13,12 @@ Recurring Tasks' own columns in place of Tasks' Start Date/Deadline/Days
 Left/Timer/Time Spent (none of which apply to a template, §12.4):
   Status, ID, up, down, Task, Number of Subtasks, Subtask of,
   Project/Category, Linked Campaign, Priority, Recurrence, Task Start On,
-  Deadline Offset (days), Notes
+  Time, If Missed, Deadline Offset (days), Notes
+(Time / If Missed added for V4, PLAN.md §22.3 -- everything after them
+shifted right by 2.)
 Hidden columns, grouped together after Notes: RecurringKey,
 RecurringParentKey, Level, SiblingOrder, LinkedCampaignKey. "Last
-Generated" (column T, right after LinkedCampaignKey) is NOT hidden --
+Generated" (column V, right after LinkedCampaignKey) is NOT hidden --
 **design correction, user-requested (PLAN.md §19 Phase 5):** originally
 planned as hidden internal state like the others, but unlike
 RecurringKey/ParentKey (pure plumbing), it's genuinely useful
@@ -67,8 +69,12 @@ _DATE_FORMAT = "DD.MM.YYYY"
 _DAYS_FORMAT = "0"
 
 _WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-_WEEKDAY_LIST_COL = 22  # V, hidden helper block (not a real sheet column)
-_DAY_NUMBER_LIST_COL = 23  # W
+_WEEKDAY_LIST_COL = 25  # Y, hidden helper block (not a real sheet column)
+_DAY_NUMBER_LIST_COL = 26  # Z
+_TIME_LIST_COL = 27  # AA -- 15-minute steps backing the Time dropdown
+_TIME_LIST_FIRST_HOUR = 6
+_TIME_LIST_LAST_HOUR = 21
+_TIME_FORMAT = "hh:mm"
 
 
 def _style_header_cell(cell):
@@ -118,23 +124,35 @@ def build(wb):
     priority_col = _write_header(ws, 10, "Priority")
     recurrence_col = _write_header(ws, 11, "Recurrence")
     task_start_on_col = _write_header(ws, 12, "Task Start On")
-    deadline_offset_col = _write_header(ws, 13, "Deadline Offset (days)")
-    notes_col = _write_header(ws, 14, "Notes")
+    # Time / If Missed (PLAN.md §22.3/§22.4). Time sets the generated
+    # Deadline's time of day (instead of the fixed 18:00) and orders a
+    # generated instance's subtasks; If Missed decides what happens to an
+    # instance still open after its day has passed (root rows only).
+    time_col = _write_header(ws, 13, "Time")
+    if_missed_col = _write_header(ws, 14, "If Missed")
+    deadline_offset_col = _write_header(ws, 15, "Deadline Offset (days)")
+    notes_col = _write_header(ws, 16, "Notes")
 
-    # --- Hidden columns, grouped together starting at column O ---
+    # --- Hidden columns, grouped together starting at column Q ---
     hidden_cols = write_hidden_hierarchy_columns(
-        ws, start_col=15, key_col_name="RecurringKey", parent_key_col_name="RecurringParentKey", header_row=HEADER_ROW
+        ws, start_col=17, key_col_name="RecurringKey", parent_key_col_name="RecurringParentKey", header_row=HEADER_ROW
     )
-    linked_campaign_key_col = _write_header(ws, 19, "LinkedCampaignKey")
+    linked_campaign_key_col = _write_header(ws, 21, "LinkedCampaignKey")
     ws.column_dimensions[linked_campaign_key_col].hidden = True
 
-    # "Last Generated" (column T) -- user-requested (PLAN.md §19 Phase 5):
+    # "Last Generated" (column V) -- user-requested (PLAN.md §19 Phase 5):
     # unlike RecurringKey/ParentKey (pure internal plumbing, stay hidden),
     # this is genuinely useful at a glance -- when a template last fired
     # -- so it's a real visible column, not hidden like the rest of this
     # block. Root-level rows only (semantic, not structurally enforced --
     # see module docstring), so it reads blank on subtask rows.
-    last_generated_col = _write_header(ws, 20, "Last Generated")
+    last_generated_col = _write_header(ws, 22, "Last Generated")
+    # Next Run (V4, PLAN.md §22.8): when the template will next generate,
+    # so a schedule can be checked without waiting for it to fire. Root
+    # rows only -- a subtask goes wherever its root goes. A per-row
+    # formula past RTColMap's LastCol, so RenumberHierarchy never
+    # rewrites it (same self-healing reasoning as Number of Subtasks).
+    next_run_col = _write_header(ws, 23, "Next Run")
 
     # --- Column widths (visible columns only) ---
     widths = {
@@ -150,18 +168,24 @@ def build(wb):
         priority_col: 10,
         recurrence_col: 12,
         task_start_on_col: 14,
+        time_col: 9,
+        if_missed_col: 12,
         deadline_offset_col: 14,
         notes_col: 8,
         last_generated_col: 14,
+        next_run_col: 14,
     }
     for letter, width in widths.items():
         ws.column_dimensions[letter].width = width
 
     # --- Number formats + static formulas across the data range ---
     for row in range(FIRST_DATA_ROW, LAST_DATA_ROW + 1):
-        ws.cell(row=row, column=13).number_format = _DAYS_FORMAT  # Deadline Offset
-        ws.cell(row=row, column=14).number_format = ds.notes_icon_format()  # Notes
-        ws.cell(row=row, column=20).number_format = _DATE_FORMAT  # LastGeneratedThroughDate
+        ws.cell(row=row, column=13).number_format = _TIME_FORMAT  # Time
+        ws.cell(row=row, column=15).number_format = _DAYS_FORMAT  # Deadline Offset
+        ws.cell(row=row, column=16).number_format = ds.notes_icon_format()  # Notes
+        ws.cell(row=row, column=22).number_format = _DATE_FORMAT  # LastGeneratedThroughDate
+        ws.cell(row=row, column=23).value = _next_run_formula(row)
+        ws.cell(row=row, column=23).number_format = _DATE_FORMAT  # not "ddd": weekday names follow the machine's locale
 
         num_sub_cell = ws.cell(row=row, column=6)
         num_sub_cell.value = number_of_subtasks_formula(id_cols["id"], row, FIRST_DATA_ROW, LAST_DATA_ROW)
@@ -178,6 +202,28 @@ def build(wb):
     recurrence_dv = DataValidation(type="list", formula1='"Daily,Weekly,Monthly"', allow_blank=True)
     recurrence_dv.add(f"{recurrence_col}{FIRST_DATA_ROW}:{recurrence_col}{LAST_DATA_ROW}")
     ws.add_data_validation(recurrence_dv)
+
+    # If Missed (PLAN.md §22.4) -- blank reads as "Carry over".
+    if_missed_dv = DataValidation(type="list", formula1='"Carry over,Skip"', allow_blank=True)
+    if_missed_dv.add(f"{if_missed_col}{FIRST_DATA_ROW}:{if_missed_col}{LAST_DATA_ROW}")
+    ws.add_data_validation(if_missed_dv)
+
+    # Time: 15-minute dropdown, but any typed time is accepted too
+    # (showErrorMessage=False) -- a 10:05 meeting shouldn't be rejected.
+    time_letter = get_column_letter(_TIME_LIST_COL)
+    time_values = [
+        (h * 60 + m) / 1440.0 for h in range(_TIME_LIST_FIRST_HOUR, _TIME_LIST_LAST_HOUR + 1) for m in (0, 15, 30, 45)
+    ]
+    for i, t in enumerate(time_values, start=1):
+        c = ws.cell(row=i, column=_TIME_LIST_COL, value=t)
+        c.number_format = _TIME_FORMAT
+    ws.column_dimensions[time_letter].hidden = True
+    wb.defined_names["TimeList"] = DefinedName(
+        "TimeList", attr_text=f"'{SHEET_NAME}'!${time_letter}$1:${time_letter}${len(time_values)}"
+    )
+    time_dv = DataValidation(type="list", formula1="=TimeList", allow_blank=True, showErrorMessage=False)
+    time_dv.add(f"{time_col}{FIRST_DATA_ROW}:{time_col}{LAST_DATA_ROW}")
+    ws.add_data_validation(time_dv)
 
     # Linked Campaign, wired the same way as Tasks' (2E) -- CampaignNameList
     # is a contiguous mirror of Campaigns' 20 (non-contiguous) slot cells.
@@ -235,10 +281,11 @@ def build(wb):
         ),
     )
     _apply_depth_shading(ws, hidden_cols["level"])
+    _apply_if_missed_root_only(ws, hidden_cols["level"], if_missed_col)
     _apply_subtask_prefix(ws, hidden_cols["level"], task_cols["task"])
 
     # Row structure (§17.12 correction, user-reported).
-    ds.apply_table_hairline_borders(ws, 1, 20, FIRST_DATA_ROW, LAST_DATA_ROW)  # through Last Generated
+    ds.apply_table_hairline_borders(ws, 1, 23, FIRST_DATA_ROW, LAST_DATA_ROW)  # through Next Run
 
     # Button-shaped up/down cells (§17.11) are deliberately NOT applied
     # here at build time -- §17.13's correction, same reasoning as Tasks'
@@ -250,7 +297,7 @@ def build(wb):
     # this sheet actually has -- no Time Spent here, but Deadline Offset
     # is Recurring Tasks' own numeric-column equivalent).
     center = Alignment(horizontal="center", vertical="center")
-    for col_letter in (id_cols["id"], task_cols["num_subtasks"], task_cols["subtask_of"], deadline_offset_col):
+    for col_letter in (id_cols["id"], task_cols["num_subtasks"], task_cols["subtask_of"], time_col, deadline_offset_col):
         for row in range(FIRST_DATA_ROW, LAST_DATA_ROW + 1):
             ws[f"{col_letter}{row}"].alignment = center
 
@@ -272,14 +319,34 @@ def build(wb):
     return ws
 
 
+def _next_run_formula(row):
+    """First scheduled date strictly after Last Generated (V), by the
+    row's Recurrence (K) / Task Start On (L) -- the same rules as
+    modRecurringTasks.ComputeScheduledDates: Daily = next Mon-Fri
+    (WORKDAY), Weekly = next matching weekday, Monthly = next matching
+    day-of-month clamped to the month's last day. "Paused" when the
+    template isn't Active; blank on subtask rows (Level S <> 0) and empty
+    rows (no RecurringKey in Q).
+    """
+    v, k, l = f"$V{row}", f"$K{row}", f"$L{row}"
+    this_month = f"DATE(YEAR({v}),MONTH({v}),MIN({l}+0,DAY(EOMONTH({v},0))))"
+    next_month = f"DATE(YEAR({v}),MONTH({v})+1,MIN({l}+0,DAY(EOMONTH({v},1))))"
+    return (
+        f'=IF(OR($Q{row}="",$S{row}<>0),"",IF($A{row}<>"Active","Paused",IF({v}="","",'
+        f'IF({k}="Daily",WORKDAY({v},1),'
+        f'IF({k}="Weekly",IFERROR({v}+MOD(MATCH({l},WeekdayList,0)-WEEKDAY({v},2)-1,7)+1,""),'
+        f'IF({k}="Monthly",IFERROR(IF({this_month}>{v},{this_month},{next_month}),""),""))))))'
+    )
+
+
 def _apply_depth_shading(ws, level_col_letter):
     """Same treatment as Tasks §6.4 -- progressively lighter row shading
-    per hierarchy depth, across the full visible column range (A:N here,
-    vs. Tasks' A:P -- this sheet has 14 visible columns, not 16).
+    per hierarchy depth, across the full visible column range (A:P, the
+    16 visible columns through Notes).
     """
     from openpyxl.formatting.rule import FormulaRule
 
-    visible_range = f"A{FIRST_DATA_ROW}:N{LAST_DATA_ROW}"
+    visible_range = f"A{FIRST_DATA_ROW}:P{LAST_DATA_ROW}"
     level_cell = f"${level_col_letter}{FIRST_DATA_ROW}"
 
     shading_steps = [100, 150, 200, 250, 300]
@@ -307,3 +374,16 @@ def _apply_subtask_prefix(ws, level_col_letter, task_col_letter):
     # required; 202 here just to be distinct from Tasks' own 201.
     rule.dxf = DifferentialStyle(numFmt=NumberFormat(numFmtId=202, formatCode='"⤷ "@'))
     ws.conditional_formatting.add(task_range, rule)
+
+
+def _apply_if_missed_root_only(ws, level_col_letter, if_missed_col_letter):
+    """If Missed only means anything on a root template (an instance is
+    skipped or carried over as a whole, PLAN.md §22.4) -- greyed-out text
+    on subtask rows signals that without blocking the cell.
+    """
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import Font
+
+    rng = f"{if_missed_col_letter}{FIRST_DATA_ROW}:{if_missed_col_letter}{LAST_DATA_ROW}"
+    rule = FormulaRule(formula=[f"${level_col_letter}{FIRST_DATA_ROW}>=1"], font=Font(color=ds.INK_MUTED))
+    ws.conditional_formatting.add(rng, rule)

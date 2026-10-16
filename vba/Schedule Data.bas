@@ -15,4 +15,6 @@ Private Sub Worksheet_Change(ByVal Target As Range)
     If Target.Column >= 4 And Target.Column <= 10 Then   ' the Meetings table, D:J
         modSchedule.ScheduleReminders
     End If
+    ' Schedule's day labels read both tables (V4, PLAN.md §22.8).
+    modSchedule.RenderScheduleBadges
 End Sub

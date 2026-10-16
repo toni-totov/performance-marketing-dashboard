@@ -161,7 +161,10 @@ def build(wb):
 
             one_time_count = f'COUNTIFS({meeting_anchor_dates},{date_cell_ref},{meeting_recurrence},"One-time")'
             recurring_count_raw = (
-                f"SUMPRODUCT(({meeting_status}=\"Active\")*(({meeting_recurrence}=\"Daily\")+"
+                # Anchor gate (PLAN.md §22.2 #3): a recurring meeting
+                # never projects backwards onto dates before it was
+                # created -- same rule as MeetingOccursOn.
+                f"SUMPRODUCT(({meeting_status}=\"Active\")*({meeting_anchor_dates}<={date_cell_ref})*(({meeting_recurrence}=\"Daily\")+"
                 # "Weekdays" (user-requested, PLAN.md §19 Phase 5): a
                 # separate recurrence type from "Daily" (unchanged, still
                 # every day), restricted to Monday-Friday --
@@ -221,8 +224,9 @@ def build(wb):
             )
 
     # --- Column widths ---
+    # 14, not 10 (V4): the badge row now shows "10:00 Stand-up +1".
     for col in range(1, 8):
-        ws.column_dimensions[get_column_letter(col)].width = 10
+        ws.column_dimensions[get_column_letter(col)].width = 14
 
     # --- Row 15: Reminder Settings button (styled only, Phase 3 wires it) ---
     ws.merge_cells(f"A{_BUTTON_ROW}:C{_BUTTON_ROW}")

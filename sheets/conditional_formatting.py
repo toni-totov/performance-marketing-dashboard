@@ -12,7 +12,7 @@ inherently -- the color is a supporting cue, not the only signal.
 """
 
 from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Font, PatternFill
 
 from . import design_system as ds
 
@@ -29,6 +29,28 @@ def _fill(hex_color):
     return PatternFill("solid", bgColor=hex_color)
 
 
+def _chip_font(hex_color):
+    """White bold text on a dark chip, default (dark) text on a light one
+    (V4, PLAN.md §22.8 -- dark text on the grey "Not Started", blue "In
+    Progress", red "High" and green "Active" chips was hard to read).
+    Decided by the fill's relative luminance, so any future chip color
+    gets the right text automatically. 0.3 rather than the strict WCAG
+    crossover (~0.18): on these mid-tone chips white reads clearly better
+    in practice even where black's ratio is marginally higher.
+    """
+    def channel(c):
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    lum = 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    return Font(color=ds.BRAND_ACCENT_TEXT, bold=True) if lum < 0.3 else None
+
+
+def _chip(formula, hex_color):
+    return FormulaRule(formula=[formula], fill=_fill(hex_color), font=_chip_font(hex_color))
+
+
 def apply_rules(ws, rules):
     """Add every (range_string, rule) pair in `rules` to `ws`."""
     for range_string, rule in rules:
@@ -42,9 +64,9 @@ def priority_rules(column_letter, first_row, last_row):
     rng = f"{column_letter}{first_row}:{column_letter}{last_row}"
     cell = f"${column_letter}{first_row}"
     return [
-        (rng, FormulaRule(formula=[f'{cell}="Low"'], fill=_fill(ds.PRIORITY_LOW))),
-        (rng, FormulaRule(formula=[f'{cell}="Medium"'], fill=_fill(ds.PRIORITY_MEDIUM))),
-        (rng, FormulaRule(formula=[f'{cell}="High"'], fill=_fill(ds.PRIORITY_HIGH))),
+        (rng, _chip(f'{cell}="Low"', ds.PRIORITY_LOW)),
+        (rng, _chip(f'{cell}="Medium"', ds.PRIORITY_MEDIUM)),
+        (rng, _chip(f'{cell}="High"', ds.PRIORITY_HIGH)),
     ]
 
 
@@ -101,20 +123,32 @@ def workflow_status_rules(
     rng = f"{column_letter}{first_row}:{column_letter}{last_row}"
     cell = f"${column_letter}{first_row}"
     return [
-        (rng, FormulaRule(formula=[f'{cell}="{not_started_label}"'], fill=_fill(ds.WORKFLOW_NOT_STARTED))),
-        (rng, FormulaRule(formula=[f'{cell}="{in_motion_label}"'], fill=_fill(ds.WORKFLOW_IN_MOTION))),
-        (rng, FormulaRule(formula=[f'{cell}="{done_label}"'], fill=_fill(ds.WORKFLOW_DONE))),
+        (rng, _chip(f'{cell}="{not_started_label}"', ds.WORKFLOW_NOT_STARTED)),
+        (rng, _chip(f'{cell}="{in_motion_label}"', ds.WORKFLOW_IN_MOTION)),
+        (rng, _chip(f'{cell}="{done_label}"', ds.WORKFLOW_DONE)),
     ]
 
 
-def diverging_rules(column_letter, first_row, last_row):
+def diverging_rules(column_letter, first_row, last_row, dead_zone=None):
     """§17.5: diverging color scale for a genuine polarity metric (e.g.
     Archive's frozen `Days Left`, "days early/late at completion"):
     positive (early) = blue, negative (late) = red, exactly zero
     (on time) = neutral gray midpoint.
+
+    `dead_zone` (V4 Archive "Early / Late", PLAN.md §22.5): values within
+    +/- dead_zone count as the midpoint, matching a number format that
+    prints them as "on time", and blank cells (e.g. a Skipped row) get no
+    color at all instead of reading as 0.
     """
     rng = f"{column_letter}{first_row}:{column_letter}{last_row}"
     cell = f"${column_letter}{first_row}"
+    if dead_zone is not None:
+        num = f"ISNUMBER({cell})"
+        return [
+            (rng, FormulaRule(formula=[f"AND({num},{cell}>={dead_zone})"], fill=_fill(ds.DIVERGING_POSITIVE))),
+            (rng, FormulaRule(formula=[f"AND({num},{cell}<=-{dead_zone})"], fill=_fill(ds.DIVERGING_NEGATIVE))),
+            (rng, FormulaRule(formula=[f"AND({num},ABS({cell})<{dead_zone})"], fill=_fill(ds.DIVERGING_MIDPOINT))),
+        ]
     return [
         (rng, FormulaRule(formula=[f"{cell}>0"], fill=_fill(ds.DIVERGING_POSITIVE))),
         (rng, FormulaRule(formula=[f"{cell}<0"], fill=_fill(ds.DIVERGING_NEGATIVE))),
@@ -135,7 +169,7 @@ def categorical_rules(column_letter, first_row, last_row, label_color_pairs):
     rng = f"{column_letter}{first_row}:{column_letter}{last_row}"
     cell = f"${column_letter}{first_row}"
     return [
-        (rng, FormulaRule(formula=[f'{cell}="{label}"'], fill=_fill(color)))
+        (rng, _chip(f'{cell}="{label}"', color))
         for label, color in label_color_pairs
     ]
 
@@ -181,6 +215,28 @@ def row_banding_rule(range_string, first_row, stripe_color=None):
     return [(range_string, FormulaRule(formula=[f"MOD(ROW()-{first_row},2)=0"], fill=_fill(color)))]
 
 
+def is_banding_rule(rule):
+    """True for a rule produced by row_banding_rule() (MOD(ROW()-n,2)=0)."""
+    return any(f.replace(" ", "").startswith("MOD(ROW()-") for f in (rule.formula or []))
+
+
+def demote_banding_rules(wb):
+    """PLAN.md §22.2 #2: row banding must never outrank a status/priority
+    chip or any other meaningful fill. openpyxl numbers rule priority in
+    the order rules were added, so a sheet that happened to add its
+    banding before its chips (Schedule Data's MeetingsTable did) had every
+    chip masked on alternate rows -- the same CF-overrides-fill class as
+    the manager build's PIC-color bugs. Rather than relying on every
+    sheet's call order, this renumbers every sheet once, at the end of the
+    build: all non-banding rules keep their relative order, banding rules
+    go last.
+    """
+    for ws in wb.worksheets:
+        rules = [r for cf in ws.conditional_formatting for r in cf.rules]
+        for i, r in enumerate(sorted(rules, key=lambda r: (is_banding_rule(r), r.priority)), start=1):
+            r.priority = i
+
+
 def binary_state_rules(column_letter, first_row, last_row, true_label, false_label):
     """§17.4's binary-state poles (good green / muted gray), for fields
     like Active/Inactive or Access Yes/No. `true_label` maps to good,
@@ -189,6 +245,6 @@ def binary_state_rules(column_letter, first_row, last_row, true_label, false_lab
     rng = f"{column_letter}{first_row}:{column_letter}{last_row}"
     cell = f"${column_letter}{first_row}"
     return [
-        (rng, FormulaRule(formula=[f'{cell}="{true_label}"'], fill=_fill(ds.WORKFLOW_DONE))),
-        (rng, FormulaRule(formula=[f'{cell}="{false_label}"'], fill=_fill(ds.WORKFLOW_NOT_STARTED))),
+        (rng, _chip(f'{cell}="{true_label}"', ds.WORKFLOW_DONE)),
+        (rng, _chip(f'{cell}="{false_label}"', ds.WORKFLOW_NOT_STARTED)),
     ]

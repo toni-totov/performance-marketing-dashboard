@@ -7,13 +7,23 @@ Attribute VB_Name = "Dashboard"
 ' Monthly Media Plan's reset button, which has real clear/advance logic
 ' behind it).
 
+Private Sub Worksheet_Activate()
+    ' Today panel (V4, PLAN.md §22.7) -- always current when you look.
+    modToday.RenderTodayPanel
+End Sub
+
 Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
     ' No "Target.Cells.Count > 1" guard -- the Refresh Now button below is
     ' a merged cell, whose Target legitimately reports Cells.Count > 1;
     ' that guard used to silently swallow its double-click (confirmed via
     ' live manual testing, PLAN.md §19 Phase 5), removed project-wide.
     If Target.Row = 4 And Target.Column = 1 Then   ' Refresh Now button (merged A4:C4)
+        ' V4 (PLAN.md §22.4/§22.7): Refresh Now also runs the recurring-task
+        ' generation (and its If-Missed auto-skip) without reopening the
+        ' file, then redraws the Today panel.
+        modRecurringTasks.RegenerateRecurringTasks
         Application.CalculateFullRebuild
+        modToday.RenderTodayPanel
         Cancel = True
     End If
 End Sub

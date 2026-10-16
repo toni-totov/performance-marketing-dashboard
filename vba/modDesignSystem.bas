@@ -160,6 +160,18 @@ End Function
 ' should appear, when I add new task," not before. Called once per button
 ' cell at the exact moment a row becomes a real task/campaign (the same
 ' isNewRow-guarded block that already sets that cell's icon text).
+' Hides Excel's green "number stored as text" triangle on an ID-style cell
+' (V4, PLAN.md §22.8) -- IDs are text on purpose ("1.10" must not become
+' 1.1). The ignore flag is per cell AND is cleared whenever the cell's
+' value is rewritten (confirmed via COM), so a build-time setting can't
+' survive RenumberHierarchy -- callers re-apply it after every renumber,
+' alongside the button restyling they already do per row. Single cell
+' only: Range.Errors fails on a multi-cell range.
+Public Sub HideNumberAsTextFlag(targetCell As Range)
+    On Error Resume Next
+    targetCell.Errors(xlNumberAsText).Ignore = True
+End Sub
+
 Public Sub ApplyButtonLook(targetCell As Range)
     With targetCell
         .Interior.Color = COLOR_CARD_SURFACE

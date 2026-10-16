@@ -4800,6 +4800,10 @@ user to retry on a throwaway V3 copy and report the exact
 `Err.Number`/`Err.Description`, since further blind fixing isn't
 productive without it).
 
+> **Resolved 2026-10-16 (§22.9):** root cause found and reproduced --
+> protected Archive/Campaigns Archive + `ListRows.Add` on the second
+> archived row; the test fixtures above only ever had one archived row.
+
 ### 21.4 Row-extender / Dashboard-scaling audit (user-requested, 2026-08-17)
 
 Before building the above, re-audited whether Bug #10's row extender
@@ -4821,3 +4825,402 @@ Campaigns) was already comprehensive per Bug #10's original design and
 COM test suite. **Conclusion: no additional fix was needed** — Bug #10
 already satisfies this requirement; this audit exists in PLAN.md mainly
 so a future session doesn't have to re-derive that from scratch.
+
+## 22. V4 — personal tracker refresh (user-requested, 2026-10-16)
+
+### 22.1 Why / scope
+
+The user has been running V3 (built before the manager-variant work, so
+**without** the faster bulk-array `RenumberHierarchy`) and asked for a
+refreshed personal build ("V4") with the new engine plus a batch of
+functional and visual improvements, delivered the same way as V3 (§21):
+fresh rebuild + self-service migration on their own laptop. **Employee
+variant only** — the manager build must keep building and behaving as
+today. Anything touching a shared file (`modHierarchy.bas`,
+`modRecurringTasks.bas`, `sheets/recurring_tasks.py`, `sheets/archive.py`,
+`sheets/dashboard.py`, `sheets/schedule.py`) is either variant-gated or
+explicitly accepted as a both-variant improvement (called out per item),
+and the manager build is rebuilt + smoke-tested after each such phase.
+
+Design forks confirmed with the user (2026-10-16):
+- Recurring-task time: **sets the generated Deadline's time** (instead of
+  the fixed 18:00) and **orders a generated instance's subtasks by time**.
+  Not a name prefix, not reminders.
+- Archive by day: a **separate "Daily Log" sheet, week view with one
+  section per day** — not header rows inside Archive (Archive is the
+  Table every Dashboard count reads; header rows would corrupt them).
+- Missed recurring instances: **archived as "Skipped"**, opt-in per
+  template. User also asked for **Skipped** and **Rescheduled** as real
+  Tasks statuses (meetings get skipped/moved one-off); Rescheduled keeps
+  its label after the date is moved.
+- Yes to: Today panel (including Schedule meetings — the user uses
+  Schedule a lot), "Copy for stand-up" button, the full visual pass
+  (§22.8). No to multi-weekday weekly recurrence.
+
+Review method: the committed template was seeded with synthetic data in a
+throwaway copy and every sheet rendered to PNG via COM (`CopyPicture` →
+chart export). The user's real file was never opened. Three real bugs
+came out of that review (§22.2).
+
+### 22.2 Phase A — bug fixes found during the review
+
+1. **Archive's friendly "Time Spent" column is blank on every row but the
+   first.** `archive.py` writes the `"0h 00m"` display formula into the
+   Table's one template row only; it isn't a Table calculated column, so
+   rows added by `ListRows.Add` get nothing (underlying hours, and so
+   Dashboard totals, were always correct). Fix: `ArchiveOneRow` writes
+   the formula itself; migration re-applies it to imported rows.
+2. **Schedule Data: Recurrence/Status chips masked on every other row.**
+   The row-banding CF (priority 6) outranks the chip rules (7–13). Same
+   CF-overrides-fill class as manager rounds #2/#4. Fix: banding is
+   always the lowest-priority rule; **audit every sheet** for a banding
+   rule outranking a chip rule (read via `FormatConditions`, per
+   CLAUDE.md).
+3. **Schedule shows meetings on wrong days.** (a) ~~"Daily" meetings
+   count on Sat/Sun~~ — **not a bug, dropped during implementation:**
+   Schedule deliberately keeps "Daily" = every day and has a separate
+   user-requested "Weekdays" type (§19 Phase 5); the review's seed data
+   just used "Daily". (b) Recurring meetings appear on dates *before* their
+   Anchor Date — add `date >= AnchorDate`. Both in the badge formula
+   (`sheets/schedule.py`) **and** `modSchedule.MeetingOccursOn`
+   (reminders), which must agree. (c) Calendar and Schedule open on
+   whatever month was last saved — `Workbook_Open` jumps both to today
+   (both variants' ThisWorkbook).
+
+   **Status: A done, COM-verified** (#2 implemented generically as
+   `conditional_formatting.demote_banding_rules(wb)` at the end of
+   `build_dashboard.build()`, both variants; #1 folded into Phase D's
+   `ArchiveOneRow` rewrite). Test-harness lesson: pass dates to VBA as
+   Excel serial numbers — pywin32 shifted a naive midnight `datetime` to
+   21:00 the previous day, which looked exactly like an anchor-gate bug.
+
+### 22.3 Phase B — Recurring Tasks: time, per-subtask schedules, placement
+
+**New visible columns** after `Task Start On`: `Time` (HH:MM; 15-minute
+dropdown, free entry allowed) and `If Missed` (`Carry over` / `Skip`,
+default `Carry over`, meaningful on root rows only). Every `RT_COL_*`
+constant after them shifts by 2.
+
+**Per-row schedules.** `Recurrence` on a *subtask* becomes optional:
+blank = "same as parent" (the default for new subtasks). Generation rule
+for each occurrence date D of the root's schedule: a descendant is
+included iff its own Status is Active, its parent was included, and its
+Recurrence is blank or its own schedule matches D. The root gates — a
+subtask scheduled on a day its root never fires is never generated
+(documented in Instructions). Rows are already in depth-first order, so
+this is a single forward pass with a `RecurringKey → included`
+dictionary.
+
+**Time.** Generated Deadline = D + Deadline Offset + (row's Time, else
+18:00). Children's SiblingOrder within a generated instance is assigned
+by Time ascending (untimed last, ties keep template order), so the day's
+meetings appear in time order.
+
+**Placement bug (user-reported).** `GenerateInstance` copied the
+template's own `SiblingOrder` onto the generated **root**, colliding with
+the user's existing top-level tasks (generated "#1" sorted beside/above
+real task #1). The root now gets `NextSiblingOrder(Tasks, "")`, so it's
+always appended below existing tasks. This also removes the
+duplicate-SiblingOrder state suspected (never confirmed) in the manager
+round-#5 crash.
+
+**Shared-module note:** the Recurring Tasks sheet is identical in both
+variants, so the new columns and generation rules apply to both
+(accepted as an improvement for the manager too). Skip logic (§22.4) is
+employee-only: the manager writer module gets no-op stubs with matching
+signatures.
+
+**Status: B done, COM-verified** (employee: per-day subtask filtering,
+Inactive child excluded, time ordering 09:00 → 10:00 → 14:00 → untimed,
+Deadline times, generated roots placed after the user's own tasks in date
+order; manager: rebuilt, generation + reopen smoke test clean).
+`modRecurringTasks.RTColMap` made Public and reused by `modMigration`
+(which had its own stale hard-coded copy).
+
+### 22.4 Phase C — Skipped / Rescheduled + auto-skip
+
+- Tasks Status list: Not Started, In Progress, Completed, **Skipped**,
+  **Rescheduled**, Delete. Chips: Skipped = neutral grey, Rescheduled =
+  orange.
+- **Skipped** → same cascade as Completed (`CascadeComplete` generalized
+  to take the final status); archived rows get `Status="Skipped"` and no
+  early/late value.
+- **Rescheduled** → opens the Calendar picker (existing §8.1 handoff,
+  target `Deadline`); the status stays "Rescheduled". Cancel leaves the
+  old deadline.
+- Tasks gains hidden **`RecurringSourceKey`** (first free column after
+  the existing helpers): the template root's `RecurringKey`, written on a
+  generated root row only.
+- **Auto-skip**, on every `RegenerateRecurringTasks` run (Workbook_Open +
+  Dashboard Refresh Now): for each Active root template with
+  `If Missed = Skip`, any open Tasks root row with that
+  `RecurringSourceKey` whose Deadline's *date* is before today is archived
+  as Skipped (whole branch). Date-before-today rather than Deadline < Now,
+  so today's 10:00 meeting doesn't vanish at 10:01; a meeting rescheduled
+  to tomorrow has a future deadline and is left alone. For Skip
+  templates, backfill only generates occurrences whose *deadline day*
+  (occurrence + root Deadline Offset) is today or later — an instance
+  that would be skipped immediately is never created.
+- **Engine change this needed:** `RecurringSourceKey` sits at Tasks col 28,
+  *after* the formula helpers (23–27), so `HierarchyColumnMap` gained
+  optional `KeepFromCol`/`KeepToCol` — a block inside `1..LastCol` that
+  `RenumberHierarchy` never clears or rewrites. Employee `TasksColMap`:
+  LastCol 28, keep 23–27. Every other map leaves them 0 (no change).
+- `ArchiveOneRow` was rewritten header-driven here (planned for D) since
+  it needed the status parameter anyway; it also writes the friendly
+  Time Spent formula per row, fixing §22.2 #1.
+- **Dashboard counts**: every "completed" count filters
+  `Status="Completed"`. Hours still sum all rows (time logged on a
+  skipped task was still spent).
+
+**Status: C done, COM-verified** (manual Skipped cascade incl. subtask,
+no early/late on skipped rows, friendly Time Spent on every archived row,
+Dashboard total excludes skips, Rescheduled → picker → deadline moved +
+label kept, Skip template backfills only today, missed instance
+auto-archived while a rescheduled-to-tomorrow one survives, carry-over
+untouched, col 28 survives a sibling reorder with helper formulas
+intact).
+
+### 22.5 Phase D — Archive reshape
+
+- Visible order: **Completed At**, Task, Project / Category, Linked
+  Campaign, Priority, Deadline, Status, **Early / Late**, Time Spent,
+  Notes, Start Date, Subtask of, Total Subtasks. ID becomes hidden (a
+  tree-position snapshot, almost always "1" out of context).
+- `Days Left` renamed **Early / Late**, same frozen value, number format
+  `0"d early";0"d late";"on time"`; blank for Skipped.
+- Skipped rows rendered grey italic via CF.
+- `ArchiveOneRow` resolves Archive columns **by header name** once per
+  cascade instead of hard-coded indexes, so this and any future reorder
+  can't silently misplace data; Archive's Notes dispatcher likewise.
+- Dashboard reads Archive only via structured refs, so the reorder
+  doesn't affect it. Manager Archive layout untouched.
+
+**Status: D done, COM-verified** (header order, ID hidden, "2d early" /
+"2d late" / "on time" text, "1h 30m" on every row, table spans all 18
+columns incl. the friendly Time Spent, Skipped-row italic CF, Notes
+double-click via `modTasks.ArchiveColumn("Notes")`). Visual check caught
+one more issue, fixed: the diverging Early/Late fill used exact 0 as
+"on time" and colored blanks grey — `cf.diverging_rules` gained an
+optional `dead_zone` (employee Archive: ±0.5, blanks uncolored; manager
+call unchanged).
+
+### 22.6 Phase E — Daily Log sheet (new, employee only)
+
+- Header: `◀  Week 42 · 12.10 – 18.10.2026  ▶`, plus **This week** and
+  **Copy for stand-up** buttons (merged-cell double-click buttons, same
+  language as Calendar). Hidden Monday-anchor cell.
+- Body rendered by VBA (`modDailyLog.RenderWeek`), since variable-length
+  grouped sections aren't legacy-formula territory. For each day Mon–Sun
+  (Sat/Sun only when they have entries): a merged navy header
+  `Monday – 12.10.2026 · 7 done · 1 skipped`, then one row per Archive row
+  completed that day in completion-time order: time, task as a
+  `Parent › Child` path (parent resolved by ParentKey in Archive, then in
+  Tasks), project, ✓ done / ⤼ skipped (grey). An empty weekday shows
+  "Nothing logged". Re-renders on sheet activate and on navigation.
+- **Copy for stand-up**: plain text for the previous working day (Monday
+  → Friday) plus today's open items due today → clipboard (late-bound
+  `htmlfile` clipboard, `MSForms.DataObject` fallback), with a
+  confirmation popup.
+- Protected sheet (UserInterfaceOnly); nothing to type here.
+
+**Status: E done, COM-verified** (per-day headers with done/skipped
+counts, today's header highlighted, time-ordered rows, `Parent › Child`
+paths, "Nothing logged", empty weekend omitted, prev/this-week
+navigation, stand-up text incl. Monday→Friday look-back and today's
+due tasks in time order, real clipboard round-trip via `htmlfile` —
+the test saves and restores the user's own clipboard — and
+Workbook_Open resetting to the current week). Files:
+`sheets/daily_log.py`, `vba/modDailyLog.bas`, `vba/Daily Log.bas`.
+
+### 22.7 Phase F — Today panel (Dashboard)
+
+New panel in the Dashboard's empty right-hand area: `TODAY – Thursday
+16.10`, rows of `time · item · type`, merged in time order from (1) open
+Tasks with a Deadline today and (2) today's Schedule meetings
+(`modSchedule.MeetingOccursOn`), plus a `+ N overdue` footer when
+applicable. VBA-rendered (merging two sources in time order isn't
+legacy-formula territory), refreshed on Workbook_Open, Dashboard activate
+and Refresh Now. Capped at ~12 rows with a "+N more" footer.
+
+**Status: F done, COM-verified.** Panel frame at `M6:Q20` (under the last
+two KPI cards, item text in a merged N:P per row so no column width
+changes). `vba/modToday.bas`. Refresh Now now also runs
+`RegenerateRecurringTasks` (picks up new occurrences + auto-skips without
+reopening). `Dashboard.bas` became per-variant: manager injects the new
+`DashboardManager.bas` (the pre-V4 content), since the employee file
+references `modToday`, which the manager build lacks.
+
+### 22.8 Phase G — visual pass
+
+- **Dashboard:** equal-width, evenly spaced KPI cards; Refresh Now as its
+  own button; Upcoming Tasks rows colored by urgency (overdue red, today
+  amber, later neutral) instead of all-amber; fix the Completed-by-month
+  chart (renders one series per month) and the oversized Nov/Dec rows;
+  hide filter buttons on Dashboard tables; "No campaigns in the next 7
+  days" empty state.
+- **Tasks:** whole-row tint for due-today, red ID-cell edge for overdue;
+  Deadline shown as "Today 18:00" / "Tomorrow 10:00" via CF-driven number
+  formats (`INT(K)=TODAY()` → `"Today "hh:mm`), real value untouched;
+  Start Date date-only; "None" in Linked Campaign rendered faint; subtask
+  count shown as progress `3/5` with a bar; ID number-as-text green
+  triangles suppressed after each renumber.
+- **Recurring Tasks:** **Next run** column (formula; subtasks show their
+  own next date under the root-gates rule, approximated as the root's).
+- **Schedule:** day cells show the first meeting (`10:00 Stand-up +1`)
+  instead of `• 2`; today highlighted.
+- **Contrast:** white text on dark chips (Not Started grey, In Progress
+  blue, High red, Active green).
+- **Navigation bar:** hyperlink strip to the main sheets where a free top
+  row exists. Sheets whose row 1 is a table header are skipped rather
+  than shifting every row constant (decided and recorded per sheet at
+  build time).
+
+**Status: G done, COM-verified + visually checked** (screenshots of
+Dashboard, Tasks, Recurring Tasks, Schedule; manager rebuilt and smoke-
+tested). As built, with deviations from the list above:
+- KPI cards: employee cards span 2-4 columns (`_KPI_SPANS_EMPLOYEE`),
+  chosen from the real visible widths so all six are ~34-41 wide (one
+  used to sit on the hidden HoursRaw column). Manager keeps 2-col cards.
+- Upcoming Tasks: overdue red/white, today amber, 1-2 days pale amber;
+  `&""` on its text columns fixes a stray "0" Project on subtasks.
+- Chart: `legend=None` + `varyColors=False` (Excel listed every month as
+  a legend entry). Campaign Metrics moved to rows 29+ so its title/header
+  rows no longer enlarge Nov/Dec. Dashboard tables hide filter buttons
+  (`hiddenButton` per AutoFilter column). Both variants (shared helpers).
+- **Navigation:** no main sheet has a free top row, so instead of a bar
+  on every sheet, a row of hyperlinks sits beside Refresh Now on the
+  Dashboard (employee). Recorded as the per-sheet decision.
+- Tasks: due-today row tint, red ID cell when overdue, Deadline shows
+  "Today/Tomorrow/Yesterday hh:mm" via CF number formats (value
+  untouched), Start Date date-only, faint "None". Subtask progress bar
+  was deferred here, then built at the user's request -- see §22.11.
+- Green "number stored as text" triangles: the ignore flag is per cell
+  and Excel clears it whenever a cell's value is rewritten (confirmed via
+  COM), so a build-time `<ignoredErrors>` patch was tried and removed --
+  `modDesignSystem.HideNumberAsTextFlag` re-applies it per row after every
+  renumber (inside the existing RefreshButtonStyling loops) and on each
+  archived row.
+- Row extender: `ExtendCFAppliesTo` now keeps each rule's own columns
+  (it used to resize every rule found on column A to A:P, which would have
+  turned the A-only overdue fill into a whole red row) and also extends
+  the new Deadline / Linked Campaign rules.
+- Contrast: `cf._chip_font` gives every chip white bold text when the fill
+  is dark (luminance < 0.3) -- shared, both variants.
+- Recurring Tasks: Next Run (col W), DD.MM.YYYY (a "ddd" weekday rendered
+  in the machine's locale).
+- Schedule: `modSchedule.RenderScheduleBadges` writes "10:00 Stand-up +1"
+  into each day's badge row (both variants), re-run after navigation,
+  meeting/location edits and on open; `MeetingOccursOn` now = shared
+  `MeetingPatternMatches` + exclusion. Columns widened 10 -> 14.
+
+**Found, not fixed (outside V4 scope, reported to the user):** in the
+MANAGER build, Dashboard (Upcoming Tasks, Overdue KPI), Calendar's
+deadline markers and Campaigns' linked-task formulas/VBA all reference
+the EMPLOYEE Tasks column positions (e.g. SortKey W vs manager V, Days
+Left M vs O, Deadline K vs M) -- so the manager's Upcoming Tasks is
+always empty and Overdue always 0. Pre-existing since the manager build
+was created. **User decision (2026-10-16): parked -- "for now we won't
+tackle the manager sheet, only my tracker."** Don't fix unprompted.
+
+### 22.11 Subtask progress (user-requested follow-up, 2026-10-16)
+
+`Progress` column on Tasks: `2/5  ▓▓░░░` = resolved (Completed or
+Skipped) subtasks out of all subtasks, at every depth; blank for a task
+that never had subtasks; green bold once everything is resolved (cue to
+complete the parent). Employee only.
+
+- **Why a hidden counter is needed:** a finished subtask leaves Tasks for
+  Archive, so nothing on Tasks remembered it. New hidden `DoneSubtasks`
+  (col 29, AC) -- `CascadeArchive` calls `CreditAncestors`, adding the
+  whole archived branch's row count to every open ancestor up to the root.
+  Total = DoneSubtasks + Total Subtasks (open descendants), so the
+  arithmetic stays consistent at every depth. TasksColMap LastCol 28→29 so
+  the counter moves with its row (Keep 23-27 unchanged).
+- **Placement (technical necessity, flagged to the user):** Progress is
+  col 30 (AD), far right after Time Spent -- a per-row display formula
+  past LastCol, like Time Spent. Next to Total Subtasks would mean
+  inserting a column mid-sheet and renumbering every hard-coded Tasks
+  column across VBA, Dashboard and Campaigns.
+- Formula lives in two places that must match: `tasks.progress_formula`
+  (build) and `modTasks.ProgressFormula` (row extender, ChrW glyphs).
+  Extender also extends the green CF.
+- **Migration:** `modTasks.SeedDoneSubtaskCounters` (called by
+  `RunAllStages` after Archive) rebuilds counters from the migrated
+  Archive -- each Completed/Skipped row credits every OPEN ancestor,
+  walking up through archived parents; skipped entirely if any counter is
+  already set (source already had the column). `DoneSubtasks` added to
+  Tasks' migrated labels + `IsNewInV4`.
+- Deleted subtasks simply drop out of the total (not counted as done).
+- **Status: done, COM-verified** (0/4 → grandchild credits child + root →
+  skipped branch counts → 3/4 → reorder keeps the counter with its row →
+  4/4 green; row extender writes the formula; migration seeds 1/2 and 1/1
+  from a V3 file's archive). Full regression A-H re-run green.
+
+### 22.12 User-testing fixes (2026-10-16)
+
+1. **"Due today" row tint removed.** It was added before depth shading so
+   it would win -- which meant a parent and its subtasks due the same day
+   all turned one colour and the hierarchy shading vanished (user: "we
+   lost the coloring hierarchy"). Replaced by a font-only cue: today's
+   Deadline ("Today hh:mm") is bold. Days Left's chip already shows 0 in
+   amber. Lesson: on Tasks, no row-wide CF FILL may outrank depth
+   shading -- only font changes are safe there.
+2. **Return from the Calendar picker.** `ApplyConfirmedSelection`/
+   `CancelSelection` used `Application.Goto target, True`, which makes the
+   target the top-left visible cell -- for Deadline (col K) that scrolled
+   ID/Task off-screen every time. New `modCalendar.ReturnToCell`: activate,
+   select the target, `ScrollColumn = 1`, `ScrollRow = row - 5`. Applies to
+   every sheet using the picker.
+
+**Status: both COM-verified** (no today-fill on a due-today subtask's row,
+bold Today deadline, picker round trip from row 27 lands on K27 with
+ScrollColumn 1 / ScrollRow 22, Cancel likewise; screenshot shows parent
+white / subtask blue). Phase G/C/progress suites re-run green.
+
+### 22.9 Phase H — migration V3 → V4
+
+`modMigration` is already header-driven (§21.3), so new and reordered
+columns mostly just work. Changes: entry point `MigrateFromPrevious`
+(old `MigrateFromV2` kept as an alias); missing source columns (`Time`,
+`If Missed`, `RecurringSourceKey`) get defaults; old `Days Left` maps to
+`Early / Late`; Archive's friendly Time Spent formula re-applied.
+**Error reporting hardened** for the still-open §21 bug: each stage runs
+under its own handler recording *stage + Err.Number + Err.Description +
+source row* in the summary instead of aborting, so a failure on the
+user's machine finally yields actionable detail. Tested against a
+V3-shaped fixture built from V3's own commit (`f26787c`) with realistic
+data, two workbooks open, qualified `Application.Run` (CLAUDE.md).
+
+**Status: H done, COM-verified -- and §21's open bug ROOT-CAUSED.** The
+fixture was the committed V3 template seeded through V3's own VBA (8 open
+tasks + a 3-level tree, 7 archived rows, an archived campaign, recurring
+templates incl. subtasks with their own Recurrence, schedule, logins,
+links) and the new file was opened with events on, exactly like a real
+user's. The UNFIXED tool reproduced the real failure on the first run:
+`1004: Table functions are not available because the sheet is protected`
+right after Tasks. Cause: Archive/Campaigns Archive are protected and
+Excel refuses `ListRows.Add` there even with UserInterfaceOnly (§7.1) --
+the migration never unprotected them. The first archived row always
+worked (it reuses the table's blank starter row), so §21's fixtures, each
+with exactly ONE archived row, could never hit it; the user's real file,
+with many, always did. Fixes in `modMigration.bas`: `RunAllStages`
+unprotects both sheets for the run and re-protects UserInterfaceOnly;
+every stage runs under its own trap and logs `!! <stage> STOPPED at
+old-file row N: error X -- text` while the rest continue; stages no
+longer chain into each other; `FindDestColumn` maps `Days Left` →
+`Early / Late`; `IsNewInV4` silences "missing" notes for Time/If Missed/
+RecurringSourceKey; migrated Archive rows go through
+`modTasks.FinishArchiveRow` (friendly Time Spent + no green triangles);
+the log flags recurring subtasks that have their own Recurrence (now a
+real per-day filter); entry point `MigrateFromPrevious` (`MigrateFromV2`
+kept as an alias). Re-run: all 9 stages clean, every check passing.
+
+**Regression:** every phase's COM suite (A-H + manager smoke) re-run
+against the final builds -- all pass.
+
+### 22.10 Order & verification
+
+A → B → C → D → E → F → G → H, each COM-verified on a fresh build before
+moving on; manager build rebuilt and smoke-tested after every phase that
+touches a shared file.

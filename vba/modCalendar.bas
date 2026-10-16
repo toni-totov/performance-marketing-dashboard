@@ -70,7 +70,22 @@ End Sub
 Public Sub ApplyConfirmedSelection(targetCell As Range, selectedDateTime As Date)
     targetCell.Value = selectedDateTime
     modCalendarHandoff.ClearCalendarHandoff
-    Application.Goto targetCell, True
+    ReturnToCell targetCell
+End Sub
+
+' Back to the cell the picker was opened from, showing its whole row
+' (PLAN.md §22.12, user-reported). This used to be Application.Goto
+' target, Scroll:=True, which makes the target the TOP-LEFT visible cell
+' -- for Tasks' Deadline (column K) that scrolled ID and Task off-screen,
+' so the user had to scroll back every time. Now: scroll fully left, put
+' the row a few lines below the top, and select the target cell. Display
+' only, so a failure here never undoes the value already written.
+Public Sub ReturnToCell(targetCell As Range)
+    targetCell.Worksheet.Activate
+    targetCell.Select
+    On Error Resume Next
+    ActiveWindow.ScrollColumn = 1
+    ActiveWindow.ScrollRow = Application.WorksheetFunction.Max(1, targetCell.Row - 5)
 End Sub
 
 Public Sub ConfirmSelection()
@@ -109,6 +124,6 @@ Public Sub CancelSelection()
     modCalendarHandoff.ClearCalendarHandoff
 
     If Not targetCell Is Nothing Then
-        Application.Goto targetCell, True
+        ReturnToCell targetCell
     End If
 End Sub

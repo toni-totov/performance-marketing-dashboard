@@ -332,6 +332,55 @@ Other lessons learned the hard way, worth not re-learning:
   `Application.Run` call with the host workbook's name from the start
   rather than debugging a generic "macro not available" error the slow
   way.
+- **A `.bas` file's `Attribute VB_Name = "..."` line must be stripped
+  before `CodeModule.AddFromString` whenever the component's `.Name` is
+  already set via the VBIDE API (`VBComponents.Add` + `comp.Name = ...`),
+  or the whole VBA project's compiled state silently corrupts — breaking
+  `Application.Run` for *every* macro in the project, not just the newly
+  added one, and producing the exact same generic "macro may not be
+  available in this workbook... all macros may be disabled" error as the
+  Trust Center/second-workbook issues above.** Confirmed live via an
+  extended debugging session that initially (wrongly) suspected Trust
+  Center settings: `VBAWarnings`/`AccessVBOM`/`AutomationSecurity` were
+  all already correct, a trivial one-line macro reproduced the failure
+  from a bare `Workbooks.Add()` workbook every time, and — the decisive
+  clue — calling a function that already worked fine (pre-existing in a
+  previously-built, previously-compiled `.xlsm`) started failing too the
+  moment a single unrelated `VBComponents.Add` call touched that same
+  project, even though the newly-added module was never itself invoked.
+  `inject_vba.py` already does this correctly (`_strip_attribute_line`,
+  used on every `_read_bas()` call before `AddFromString`) — this bit
+  only because a throwaway COM test script fed `AddFromString` the raw
+  `.bas` text (Attribute line intact) after already setting `comp.Name`
+  explicitly. Any new test harness that injects VBA via `AddFromString`
+  must strip that line the same way, or risk a long, misleading detour
+  into Trust Center registry settings that were never the actual problem.
+- **Seed at least TWO rows into any Table that starts with a blank
+  "starter" row before trusting a test of code that appends to it.** The
+  first append reuses the starter row (`NextArchiveRow`/`NextTableRow`)
+  and never calls `ListRows.Add`, so a one-row fixture can't hit any
+  failure that only `ListRows.Add` has -- most importantly "Table
+  functions are not available because the sheet is protected" (1004),
+  which `UserInterfaceOnly` does NOT prevent (PLAN.md §7.1). This hid the
+  V2→V3 migration bug for two months: every fixture had exactly one
+  archived row; the user's real file had many (PLAN.md §22.9). Any code
+  that appends to Archive/Campaigns Archive outside the existing cascades
+  must `Unprotect` → append → `Protect UserInterfaceOnly:=True` itself.
+- **Pass dates to VBA from Python as Excel serial numbers, not
+  `datetime` objects.** pywin32 converted a naive midnight `datetime` via
+  the local timezone and VBA received 21:00 the previous day -- which
+  looked exactly like an off-by-one-day bug in the code under test
+  (`harness.serial()` in the V4 test scripts).
+- **Excel's "ignore this error" flag (the green number-stored-as-text
+  triangle) is per cell and is CLEARED whenever that cell's value is
+  rewritten** -- confirmed via COM. So it can't be set once at build time
+  for any column the hierarchy engine rewrites (ID, Subtask of): re-apply
+  `modDesignSystem.HideNumberAsTextFlag` per cell after every renumber.
+  (openpyxl also models `<ignoredErrors>` but never writes it; a manual
+  XML patch worked but was pointless for the reason above, and putting
+  the element in the wrong position -- after `<tableParts>` -- made
+  Excel refuse to open the file at all.) `Range.Errors` also fails on a
+  multi-cell range; loop single cells.
 
 ## Recurring architectural patterns established across sheets
 

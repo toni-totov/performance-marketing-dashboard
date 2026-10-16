@@ -24,8 +24,8 @@ F Today panel -> G visual pass -> H migration V3->V4. Phase status:
 
 **All 8 phases built; full regression (A-H + manager smoke) green.** Both
 `Performance Marketing Dashboard.xlsm` and `Task Tracker - Manager.xlsm`
-rebuilt from current source. **Nothing committed yet** (standing rule:
-only when asked). **Not yet done by the user:** actually migrating their
+rebuilt from current source. **Committed 2026-10-16 as db345b9 on branch
+`v4-refresh`** (not merged into master, not pushed). **Not yet done by the user:** actually migrating their
 real V3 file into the new build on their laptop (`MigrateFromPrevious`,
 Alt+F8, on a throwaway copy first) and using V4 for real.
 

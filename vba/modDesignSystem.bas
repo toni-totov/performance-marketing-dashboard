@@ -172,6 +172,94 @@ Public Sub HideNumberAsTextFlag(targetCell As Range)
     targetCell.Errors(xlNumberAsText).Ignore = True
 End Sub
 
+' Lets the user TYPE dates as 17.10.2026 (optionally "17.10.2026 14:30",
+' "17.10.26" or just "17.10" for this year) on any machine (user-requested
+' 2026-10-17). Every date cell already DISPLAYS as DD.MM.YYYY, but how
+' Excel parses typed input follows the Windows region settings, not the
+' cell's format -- on a US-locale laptop "17.10.2026" stays plain text and
+' every formula reading the cell breaks. Called first thing from each
+' sheet's Worksheet_Change: any date-formatted cell (NumberFormat starting
+' "DD.MM.YYYY", so no per-sheet column lists to keep in sync) that ended
+' up holding text in day.month.year order is rewritten as a real date.
+' Text that isn't a valid date is left alone. Multi-cell safe (paste/fill).
+Public Sub NormalizeDateInput(ByVal Target As Range)
+    On Error GoTo Done
+    If Target.CountLarge > 5000 Then Exit Sub
+    Dim c As Range, d As Variant
+    For Each c In Target.Cells
+        If VarType(c.Value) = vbString Then
+            If UCase$(Left$(Replace(c.NumberFormat, "\", ""), 10)) = "DD.MM.YYYY" Then   ' may read back escaped as dd\.mm\.yyyy
+                d = ParseDayFirstDate(CStr(c.Value))
+                If Not IsEmpty(d) Then
+                    Application.EnableEvents = False
+                    c.Value = d
+                    Application.EnableEvents = True
+                End If
+            End If
+        End If
+    Next c
+Done:
+    Application.EnableEvents = True
+End Sub
+
+' "d.m.yyyy[ h:mm]" (also "/" or "-" as the separator, 2-digit year, or
+' no year) -> a Date, or Empty when the text isn't a real calendar date.
+' Built from numbers via DateSerial/TimeSerial, never CDate/DateValue,
+' which would re-apply the very locale rules this exists to bypass.
+Public Function ParseDayFirstDate(ByVal s As String) As Variant
+    On Error GoTo Invalid   ' e.g. an overflowing digit run -- just "not a date"
+    Dim datePart As String, timePart As String, p As Long
+    s = Trim$(s)
+    p = InStr(s, " ")
+    If p > 0 Then
+        datePart = Left$(s, p - 1)
+        timePart = Trim$(Mid$(s, p + 1))
+    Else
+        datePart = s
+    End If
+    datePart = Replace(Replace(datePart, "/", "."), "-", ".")
+    If Right$(datePart, 1) = "." Then datePart = Left$(datePart, Len(datePart) - 1)
+
+    Dim bits() As String
+    bits = Split(datePart, ".")
+    If UBound(bits) < 1 Or UBound(bits) > 2 Then Exit Function
+    Dim i As Long
+    For i = 0 To UBound(bits)
+        If Len(bits(i)) = 0 Or Not bits(i) Like String$(Len(bits(i)), "#") Then Exit Function
+    Next i
+
+    Dim dd As Long, mm As Long, yy As Long
+    dd = CLng(bits(0)): mm = CLng(bits(1))
+    If UBound(bits) = 2 Then
+        yy = CLng(bits(2))
+        If Len(bits(2)) <= 2 Then
+            yy = yy + 2000
+        ElseIf Len(bits(2)) <> 4 Then
+            Exit Function
+        End If
+    Else
+        yy = Year(Date)
+    End If
+    If mm < 1 Or mm > 12 Or dd < 1 Or dd > 31 Then Exit Function
+    Dim result As Date
+    result = DateSerial(yy, mm, dd)
+    If Day(result) <> dd Then Exit Function   ' e.g. 31.02 rolled into March
+
+    If Len(timePart) > 0 Then
+        Dim hm() As String
+        hm = Split(timePart, ":")
+        If UBound(hm) <> 1 Then Exit Function
+        If Len(hm(0)) = 0 Or Len(hm(1)) = 0 Then Exit Function
+        If Not hm(0) Like String$(Len(hm(0)), "#") Or Not hm(1) Like String$(Len(hm(1)), "#") Then Exit Function
+        If CLng(hm(0)) > 23 Or CLng(hm(1)) > 59 Then Exit Function
+        result = result + TimeSerial(CLng(hm(0)), CLng(hm(1)), 0)
+    End If
+    ParseDayFirstDate = result
+    Exit Function
+Invalid:
+    ParseDayFirstDate = Empty
+End Function
+
 Public Sub ApplyButtonLook(targetCell As Range)
     With targetCell
         .Interior.Color = COLOR_CARD_SURFACE

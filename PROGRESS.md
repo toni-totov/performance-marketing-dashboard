@@ -34,6 +34,10 @@ build's Dashboard/Calendar/Campaigns read employee Tasks column positions
 (PLAN.md §22.8 "Found, not fixed") -- "for now we won't tackle the
 manager sheet." The manager .xlsm was NOT rebuilt after this decision.
 
+**Day-first date typing (§22.13, 2026-10-17): built + COM-verified** --
+typing 17.10.2026 now becomes a real date regardless of the laptop's
+region settings. Employee .xlsm rebuilt.
+
 **Subtask progress (§22.11): built + COM-verified** after the user asked
 for it.
 

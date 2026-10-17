@@ -3,10 +3,14 @@ Attribute VB_Name = "Monthly Media Plan"
 ' the Monthly Media Plan WORKSHEET's own code module by Phase 4's
 ' inject_vba.py (see PLAN.md §18's sheet-named-.bas convention). Only two
 ' interactive elements, both one-off single cells (§9.4/§9.5) -- branches
-' by Row+Column, same convention as Calendar's own dispatcher. No
-' Worksheet_Change handler: every data column is either a native Table
-' dropdown/free-typed cell already enforced by Data Validation, or the
-' self-healing Budget (USD) formula -- nothing needs VBA interception.
+' by Row+Column, same convention as Calendar's own dispatcher. The
+' Worksheet_Change handler only normalizes typed day-first dates
+' (modDesignSystem.NormalizeDateInput); every other column is a native
+' Table dropdown/free-typed cell or the self-healing Budget (USD) formula.
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    modDesignSystem.NormalizeDateInput Target   ' typed 17.10.2026 -> real date on any locale
+End Sub
 
 Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
     ' No "Target.Cells.Count > 1" guard -- both buttons below are merged

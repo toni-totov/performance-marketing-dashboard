@@ -7,6 +7,7 @@ Attribute VB_Name = "Tasks"
 ' in modTasks.bas so it stays independently testable via Application.Run.
 
 Private Sub Worksheet_Change(ByVal Target As Range)
+    modDesignSystem.NormalizeDateInput Target   ' typed 17.10.2026 -> real date on any locale
     If Target.Cells.Count > 1 Then Exit Sub
     If Target.Row < 2 Then Exit Sub
 

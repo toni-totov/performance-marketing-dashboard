@@ -7,6 +7,7 @@ Attribute VB_Name = "Campaigns"
 ' no modCampaigns wrapper needed for it.
 
 Private Sub Worksheet_Change(ByVal Target As Range)
+    modDesignSystem.NormalizeDateInput Target   ' typed 17.10.2026 -> real date on any locale
     If Target.Cells.Count > 1 Then Exit Sub
     If Target.Row < 3 Then Exit Sub
 

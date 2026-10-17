@@ -12,6 +12,7 @@ Attribute VB_Name = "Schedule Data"
 ' directly instead of relying on this handler, which never fires for them.
 
 Private Sub Worksheet_Change(ByVal Target As Range)
+    modDesignSystem.NormalizeDateInput Target   ' typed 17.10.2026 -> real date on any locale
     If Target.Column >= 4 And Target.Column <= 10 Then   ' the Meetings table, D:J
         modSchedule.ScheduleReminders
     End If

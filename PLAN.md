@@ -5224,3 +5224,25 @@ against the final builds -- all pass.
 A → B → C → D → E → F → G → H, each COM-verified on a fresh build before
 moving on; manager build rebuilt and smoke-tested after every phase that
 touches a shared file.
+
+### 22.13 Typing dates as 17.10.2026 on any machine (user-requested, 2026-10-17)
+
+Every date cell already *displays* `DD.MM.YYYY`, but Excel parses typed
+input by the **Windows region settings**, not the cell's format: on a
+US-locale laptop `17.10.2026` stays plain text (and formulas reading it
+break), and only `10/17/2026` is accepted. Fix: `modDesignSystem.
+NormalizeDateInput`, called first in every sheet's `Worksheet_Change`
+where dates are typed (Tasks, Campaigns, Monthly Media Plan, Login
+Information, Schedule Data -- the latter two gained a handler for it).
+It converts any text sitting in a cell whose format starts `DD.MM.YYYY`
+(so no per-sheet column lists) via `ParseDayFirstDate`: `d.m.yyyy`,
+optional ` h:mm`, `/` or `-` separators, 2-digit year (→20xx), or no year
+(→ current year); built with `DateSerial`/`TimeSerial`, never `CDate`,
+which would re-apply the locale. Invalid text (31.02, 13.13, words) is
+left untouched. Gotcha: `NumberFormat` can read back escaped as
+`dd\.mm\.yyyy`, so backslashes are stripped before comparing. Not
+possible to fix: on a month-first locale, an *ambiguous* entry like
+`05/10/2026` is turned into a real date (10 May) by Excel before any
+code sees it -- use dots. Manager build not updated (parked).
+COM-verified: parser cases + end-to-end text→date on all five sheets,
+plus controls (non-date column and events-off both stay text).
